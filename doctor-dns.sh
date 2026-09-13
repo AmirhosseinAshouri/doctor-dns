@@ -4493,6 +4493,7 @@ exit 0
 #import http.client
 #import http.cookies
 #import http.server
+#import ipaddress
 #import json
 #import os
 #import re
@@ -5333,7 +5334,38 @@ exit 0
 #details.pw form{padding:0 16px 4px}
 #details.pw .note{padding:0 16px 14px;margin-top:8px}
 #.ok{color:#7dd3a0}.bad{color:#f85149}.warn{color:#e3b341}
+#.shell{width:100%;max-width:440px}
+#.brand{text-align:center;margin:0 0 18px;direction:ltr;line-height:1.15}
+#.brand .mark{font-size:30px;vertical-align:middle;margin-right:8px}
+#.brand .name{display:inline-block;vertical-align:middle;font-size:clamp(32px,10vw,42px);
+# font-weight:800;letter-spacing:1.5px;color:#7dd3a0;
+# background:linear-gradient(90deg,#7dd3a0,#58a6ff);-webkit-background-clip:text;
+# background-clip:text;-webkit-text-fill-color:transparent}
+#footer{text-align:center;color:#6e7681;font-size:12px;padding:16px 0 0;direction:ltr}
+#.manual input{direction:ltr;text-align:center;letter-spacing:.5px}
 #"""
+#
+## Where the installer writes the version it installed. Read per page rather
+## than once, so it can never disagree with what is on disk.
+#VERSION_FILE = "/var/lib/smart-dns/version"
+#
+#
+#def app_version():
+#    try:
+#        with open(VERSION_FILE) as fh:
+#            return fh.read().strip()[:20]
+#    except OSError:
+#        return ""
+#
+#
+#def brand_html():
+#    return ("<div class='brand'><span class='mark'>🩺</span>"
+#            "<span class='name'>doctor dns</span></div>")
+#
+#
+#def footer_html():
+#    v = app_version()
+#    return "<footer>doctor dns%s</footer>" % (" v" + html.escape(v) if v else "")
 #
 #
 #def brand():
@@ -5350,8 +5382,32 @@ exit 0
 #    return ("""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 #<meta name="viewport" content="width=device-width,initial-scale=1">
 #<title>%s</title><style>%s</style></head><body>
-#<div class="card">%s</div></body></html>"""
-#            % (html.escape(brand()), USER_CSS, inner))
+#<div class="shell">%s<div class="card">%s</div>%s</div></body></html>"""
+#            % (html.escape(brand()), USER_CSS, brand_html(), inner, footer_html()))
+#
+#
+## A Persian keyboard types these, and the address box should not care.
+#DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩٫", "01234567890123456789.")
+#
+#
+#def typed_ip(text):
+#    """An address the customer typed by hand: (address, "") or ("", why).
+#
+#    The exit refuses one that belongs to another account, so what is left for
+#    here is everything that could never be somebody's internet connection - a
+#    private or reserved address, or one of this service's own two machines.
+#    """
+#    text = (text or "").translate(DIGITS).strip()
+#    try:
+#        addr = ipaddress.IPv4Address(text)
+#    except ValueError:
+#        return "", "این آی‌پی درست نیست — چهار عدد با نقطه، مثل 5.123.45.67"
+#    if not addr.is_global or addr.is_multicast:
+#        return "", ("این آی‌پی عمومی نیست. آی‌پی اینترنت خود را بنویسید، "
+#                    "نه آی‌پی داخل شبکهٔ خانه (مثل 192.168...)")
+#    if str(addr) in ((CFG or {}).get("SELF_IP"), (CFG or {}).get("PANEL_HOST")):
+#        return "", "این آی‌پی مال سرورهای خود سرویس است"
+#    return str(addr), ""
 #
 #
 #def landing(banner=""):
@@ -5426,8 +5482,29 @@ exit 0
 #            "شده‌اید — آن را ببندید، همین صفحه را تازه کنید و بعد ثبت کنید.</p>"
 #            "<p class='note'>آی‌پی خانگی معمولاً ثابت نیست. اگر مودم را ریست "
 #            "کردید و سرویس قطع شد، دوباره به همین صفحه بیایید و ثبت کنید.</p>"
-#            "<p class='alt'><a href='/'>فعلاً نه، برو به حساب</a></p>"
-#            % html.escape(ip))
+#            % html.escape(ip)
+#            + manual_ip_box() +
+#            "<p class='alt'><a href='/'>فعلاً نه، برو به حساب</a></p>")
+#
+#
+#def manual_ip_box(back=""):
+#    """The box for typing an address by hand, here and on the account page.
+#
+#    Somebody on mobile data who wants the service at home would otherwise have
+#    to go home before they could register it. `back` is where a refusal sends
+#    them, so they land on the page they typed it on.
+#    """
+#    hidden = ("<input type='hidden' name='back' value='%s'>" % html.escape(back)
+#              if back else "")
+#    return ("<div class='dns manual'><div class='k'>ثبت دستی آی‌پی</div>"
+#            "<p class='note' style='margin-top:0'>سرویس را برای اینترنت دیگری "
+#            "می‌خواهید؟ مثلاً الان با موبایل آمده‌اید ولی سرویس را برای اینترنت "
+#            "خانه لازم دارید. آی‌پی آن اینترنت را اینجا بنویسید؛ از صفحهٔ مودم "
+#            "یا یک سایت «آی‌پی من چیست» روی همان اینترنت پیدایش می‌کنید.</p>"
+#            "<form method='post' action='/register-ip'>%s"
+#            "<input name='ip' required maxlength='40' inputmode='decimal' "
+#            "placeholder='5.123.45.67' autocomplete='off' spellcheck='false'>"
+#            "<button class='ghost'>ثبت این آی‌پی</button></form></div>" % hidden)
 #
 #
 #def account_notice(info):
@@ -5738,9 +5815,20 @@ exit 0
 #
 #        if path != "/register-ip":
 #            return self.send_html("<h1>404</h1>", 404)
+#        # Nothing typed is the button: the address this page is opened from.
+#        form = self.form()
+#        typed = (form.get("ip") or "").strip()
+#        # One of two pages of our own, whatever the form claims.
+#        back = "/" if form.get("back") == "/" else "/register-ip"
+#        if typed:
+#            ip, why = typed_ip(typed)
+#            if not ip:
+#                return self.redirect(back, why, bad=True)
+#            log(INFO, "panel: %s registered %s by hand" % (self.client_ip(), ip))
+#        else:
+#            ip = self.client_ip()
 #        try:
-#            res = post("/user-claim", {"session": self.session(),
-#                                       "ip": self.client_ip()})
+#            res = post("/user-claim", {"session": self.session(), "ip": ip})
 #        except Exception as e:
 #            log(ERROR, "panel: user-claim failed: %s" % e)
 #            res = {"ok": False, "message": "الان نشد"}
@@ -5822,6 +5910,7 @@ exit 0
 #                "ثبت دوباره همین آی‌پی</a>"
 #                "<p class='note'>آی‌پی شما درست ثبت شده. اگر مودم را ریست کردید و "
 #                "سرویس قطع شد، همین صفحه را باز کنید و این دکمه را بزنید.</p>")
+#        body.append(manual_ip_box("/"))
 #        body.append(
 #            "<div class='dns'><div class='k'>ارسال رسید پرداخت</div>"
 #            "<p class='note' style='margin-top:0'>عکس فیش واریزی را بفرستید تا "
@@ -6539,7 +6628,36 @@ exit 0
 #.pick button{padding:3px 10px;font-size:11px;font-weight:400;
 # background:transparent;border:1px solid #30363d;color:#8b949e}
 #.pick button:hover{background:#1c2029}
+#.brand{text-align:center;margin:4px 0 26px;direction:ltr;line-height:1.15}
+#.brand .mark{font-size:clamp(28px,6vw,38px);vertical-align:middle;margin-right:10px}
+#.brand .name{display:inline-block;vertical-align:middle;font-size:clamp(34px,8vw,50px);
+# font-weight:800;letter-spacing:1.5px;color:#7dd3a0;
+# background:linear-gradient(90deg,#7dd3a0,#58a6ff);-webkit-background-clip:text;
+# background-clip:text;-webkit-text-fill-color:transparent}
+#footer{text-align:center;color:#6e7681;font-size:12px;padding:26px 0 6px;direction:ltr}
 #"""
+#
+## Where the installer writes the version it installed. Read per page rather
+## than once, so it can never disagree with what is on disk.
+#VERSION_FILE = "/var/lib/smart-dns/version"
+#
+#
+#def app_version():
+#    try:
+#        with open(VERSION_FILE) as fh:
+#            return fh.read().strip()[:20]
+#    except OSError:
+#        return ""
+#
+#
+#def brand_html():
+#    return ("<div class='brand'><span class='mark'>🩺</span>"
+#            "<span class='name'>doctor dns</span></div>")
+#
+#
+#def footer_html():
+#    v = app_version()
+#    return "<footer>doctor dns%s</footer>" % (" v" + html.escape(v) if v else "")
 #
 #
 #def page(title, body, cfg, active="", msg=None, msg_kind="good"):
@@ -6555,10 +6673,11 @@ exit 0
 #    return ("""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 #<meta name="viewport" content="width=device-width,initial-scale=1">
 #<link rel="icon" href="data:,">
-#<title>%s</title><style>%s</style></head><body><div class="wrap">
+#<title>%s</title><style>%s</style></head><body><div class="wrap">%s
 #<header><h1>%s</h1><nav>%s<a href='/%s/logout'>خروج</a></nav></header>
-#%s%s</div></body></html>""" % (html.escape(title), CSS, html.escape(title), nav,
-#                               cfg["ADMIN_PATH"], banner, body))
+#%s%s%s</div></body></html>""" % (html.escape(title), CSS, brand_html(),
+#                                 html.escape(title), nav, cfg["ADMIN_PATH"],
+#                                 banner, body, footer_html()))
 #
 #
 #def login_page(cfg, error=None):
@@ -6569,12 +6688,14 @@ exit 0
 #    return """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 #<meta name="viewport" content="width=device-width,initial-scale=1">
 #<link rel="icon" href="data:,">
-#<title>ورود</title><style>%s</style></head><body><div class="wrap"><div class="login">
+#<title>ورود</title><style>%s</style></head><body><div class="wrap">%s
+#<div class="login" style="margin-top:6vh">
 #<div class="card"><h2>پنل مدیریت</h2>%s
 #<form method="post" action="/%s/"><div class="f"><label>رمز عبور</label>
 #<input type="password" name="password" autofocus style="width:100%%"></div>
 #<button type="submit" style="width:100%%">ورود</button></form></div>
-#</div></div></body></html>""" % (CSS, err, cfg["ADMIN_PATH"])
+#</div>%s</div></body></html>""" % (CSS, brand_html(), err, cfg["ADMIN_PATH"],
+#                                   footer_html())
 #
 #
 #def bar(used, total):
