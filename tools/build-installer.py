@@ -52,6 +52,7 @@ PAYLOADS = [
     ("SMARTDNS_LOGS", "templates/smartdns-logs"),
     ("SMARTDNS_RULES", "templates/smartdns-rules"),
     ("SMARTDNS_RESTART", "templates/smartdns-restart"),
+    ("SMARTDNS_WATCH", "templates/smartdns-watch"),
     ("EPIC_PIN", "templates/epic-pin"),
     ("EPIC_PIN_SERVICE", "templates/epic-pin.service"),
     ("EPIC_PIN_TIMER", "templates/epic-pin.timer"),

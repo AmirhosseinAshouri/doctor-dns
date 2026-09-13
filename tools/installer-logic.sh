@@ -892,6 +892,12 @@ if [ "$ROLE" = relay ]; then
     chmod +x /usr/local/bin/smartdns-rules
     info "try: smartdns-rules check gemini.google.com"
 
+    step "smartdns-watch command, for the names a customer asks for"
+    note_file /usr/local/bin/smartdns-watch
+    payload SMARTDNS_WATCH > /usr/local/bin/smartdns-watch
+    chmod +x /usr/local/bin/smartdns-watch
+    info "try: smartdns-watch <username or address>"
+
     step "epic-pin, keeping Epic's backend on addresses that answer from here"
     # epic-pins.conf is written later by epic-pin itself, but it is ours either
     # way and uninstall needs to know to take it with us.

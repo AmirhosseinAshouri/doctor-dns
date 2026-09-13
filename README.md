@@ -286,6 +286,24 @@ smartdns-rules check gemini.google.com
                                  # disagree
 ```
 
+**`smartdns-watch`** — the names a customer's device asks for, live, and
+where this relay sent each. For finding what a service needs routed: have the
+customer open it until it fails, and watch.
+
+```sh
+sudo smartdns-watch ali          # one customer - by username, by the label
+                                 # smartdns-acl list shows (u12), or by address
+sudo smartdns-watch              # everybody, each line naming who asked
+```
+
+`via relay` is already routed. `direct` went around the relay: if the service
+refuses Iran, those are the names to add, with `smartdns add` or the panel's
+domains page. `filtered in Iran` is Iran's own block, which no routing gets
+past, and `no answer` usually means the address is not registered. Add only
+names a service uses over HTTPS or plain HTTP - a game's match servers talk on
+other ports, and routing them breaks the game. Nothing is kept: what it prints
+is all there is.
+
 **`smartdns-acl`** — who may use the relay, and what they have used. The panel
 drives this rather than touching nftables itself, so there is one place where
 the rules about what is legal live.

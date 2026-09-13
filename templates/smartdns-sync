@@ -331,6 +331,34 @@ def save_template_names(info):
     return True
 
 
+# Who each allowed address belongs to, as the panel knows them. Only
+# smartdns-watch reads it, to take a username where an address would do.
+USER_NAMES = "/var/lib/smart-dns/users.json"
+
+
+def save_user_names(allowed):
+    """Keep who each allowed address belongs to. Returns whether it changed.
+
+    Readable by root alone: it ties usernames to home addresses.
+    """
+    rows = {a["ip"]: {"label": a.get("name", ""), "user": a.get("user", "")}
+            for a in allowed or [] if isinstance(a, dict) and a.get("ip")}
+    text = json.dumps(rows, ensure_ascii=False, sort_keys=True) + "\n"
+    try:
+        with open(USER_NAMES, encoding="utf-8") as fh:
+            if fh.read() == text:
+                return False
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(USER_NAMES), exist_ok=True)
+    tmp = USER_NAMES + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, USER_NAMES)
+    return True
+
+
 def epic_pin_lines():
     """epic-pin's rules, to be written into the profiles that still want them.
 
@@ -756,6 +784,10 @@ def sync_once():
         save_template_names(answer.get("templates"))
     except Exception as e:
         log(WARN, "template names not saved: %s" % e)
+    try:
+        save_user_names(answer.get("allowed"))
+    except Exception as e:
+        log(WARN, "user names not saved: %s" % e)
 
     names = {a["ip"]: a.get("name", "") for a in answer.get("allowed", [])}
     want = set(names)
