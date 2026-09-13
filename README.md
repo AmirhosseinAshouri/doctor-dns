@@ -161,7 +161,7 @@ tests, so that your money does not go on a server that will not work.
 |---|---|
 | AWS Lightsail, Germany | worked without problems |
 | Hetzner (Germany, Finland) | worked without problems, and fast - about 2 MB/s |
-| Linode Frankfurt, OVH France, a host in Turkey | worked well |
+| Linode Frankfurt, OVH France, a netlen host in Turkey | worked well |
 | DigitalOcean | did not work in any of the 8 regions tested; the connection opens, but after a few KB nothing more gets through |
 | OVH (some newer addresses) | the same problem as DigitalOcean |
 | Vultr Miami | works, but very slowly - about 100 KB/s |
