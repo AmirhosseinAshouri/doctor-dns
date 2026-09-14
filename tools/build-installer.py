@@ -48,6 +48,8 @@ PAYLOADS = [
     ("CERT_TIMER", "templates/smartdns-cert.timer"),
     ("ADMIN", "templates/smartdns-admin"),
     ("ADMIN_SERVICE", "templates/smartdns-admin.service"),
+    ("BOT", "templates/smartdns-bot"),
+    ("BOT_SERVICE", "templates/smartdns-bot.service"),
     ("SMARTDNS_ACCESS", "templates/smartdns-access"),
     ("SMARTDNS_LOGS", "templates/smartdns-logs"),
     ("SMARTDNS_RULES", "templates/smartdns-rules"),

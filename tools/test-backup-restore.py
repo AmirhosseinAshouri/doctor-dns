@@ -167,10 +167,13 @@ check("no staging file left behind",
            if f.startswith(".restore-")],
       str(os.listdir(os.path.dirname(db_path))))
 
-print("the settings page no longer offers the bot token")
+# The bot left this panel once and came back as smartdns-bot, with its token
+# set here again. What still has to hold is that the page never shows it whole.
+print("the settings page takes the bot token but never shows it")
 src_text = open(os.path.join(HERE, "..", "templates", "smartdns-admin"),
                 encoding="utf-8").read()
-check("no bot_token field in the panel", "bot_token" not in src_text)
+check("the token is shown masked", "mask_token(token)" in src_text
+      and "html.escape(token)" not in src_text)
 check("the backup card is there", "backup.db" in src_text)
 
 shutil.rmtree(tmp, ignore_errors=True)

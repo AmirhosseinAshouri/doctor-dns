@@ -1,0 +1,1222 @@
+#!/usr/bin/env python3
+"""smartdns-bot - the service's Telegram bot.
+
+It runs on the exit, beside smartdns-panel, for the plain reason that Telegram
+is filtered inside Iran and a relay could not reach it. It is a process of its
+own rather than a thread in the panel: the panel's sync API is what keeps every
+customer connected, and neither a Telegram outage nor a bug in a chat handler
+should be able to take that down.
+
+It holds no rules of its own. What a plan does to an account, how an address is
+registered and how a payment is settled live in smartdns-panel, which this loads
+as a module, so there is one copy of each. Messages that come out of those
+rules - a warning, an approval - are queued in the outbox table by whichever
+process made the decision, and delivered from here.
+
+Two things a customer starts in the bot finish on a relay, because they have
+to: the mini app that registers an address (only the relay sees the customer's
+real one) and online payment (Zarinpal wants an Iranian server, and the
+customer's browser has to come back to one). The relay reports where its pages
+are on every sync, and the bot links there.
+
+The token lives in the database, set from the admin panel's settings or with
+`smartdns-bot token`. Nothing needs restarting: the bot reads it every few
+seconds and connects, reconnects or goes quiet to match.
+
+    smartdns-bot              run the bot - what the service does
+    smartdns-bot status       the token, the bot's name, its admins, the relay
+    smartdns-bot token        set the token (asked for, so it stays out of history)
+    smartdns-bot code         a fresh one-time code for becoming the bot's admin
+    smartdns-bot off          forget the token
+
+Standard library only, like everything else here.
+"""
+
+import getpass
+import hmac
+import importlib.machinery
+import importlib.util
+import ipaddress
+import json
+import os
+import re
+import secrets
+import signal
+import sqlite3
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from datetime import datetime, timedelta, timezone
+
+PANEL_CODE = os.environ.get("SMARTDNS_PANEL", "/usr/local/bin/smartdns-panel")
+TELEGRAM = os.environ.get("TELEGRAM_API", "https://api.telegram.org")
+# Long polling: Telegram holds the request open this long when there is nothing
+# to say, so the bot answers at once without asking every second.
+POLL_SECONDS = 20
+TOKEN_RE = re.compile(r"^\d{5,15}:[A-Za-z0-9_-]{30,64}$")
+# A Persian or Arabic keyboard types these, and a number should not care. The
+# separators matter as much as the digits: "۱۵۰٬۰۰۰" is a price.
+DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩٫٬،", "01234567890123456789.,,")
+RECEIPT_TYPES = ("image/jpeg", "image/png", "image/webp", "application/pdf")
+
+P = None        # smartdns-panel, loaded in main() - or handed in by a test
+
+
+def load_panel(path=None):
+    spec = importlib.util.spec_from_loader(
+        "smartdns_panel", importlib.machinery.SourceFileLoader(
+            "smartdns_panel", path or PANEL_CODE))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# ------------------------------------------------------------------ telegram
+class TelegramError(Exception):
+    def __init__(self, message, code=None, retry_after=None):
+        super().__init__(message)
+        self.code = code
+        self.retry_after = retry_after
+
+
+class Telegram:
+    """The few Bot API calls this needs, over urllib.
+
+    Nothing here ever writes the token down: it is in every URL, so errors are
+    reported by Telegram's description and never by the request.
+    """
+
+    def __init__(self, token, base=None):
+        self.token = token
+        self.base = base or TELEGRAM
+
+    def call(self, method, **params):
+        body = json.dumps({k: v for k, v in params.items() if v is not None}).encode()
+        req = urllib.request.Request(
+            "%s/bot%s/%s" % (self.base, self.token, method), data=body,
+            headers={"Content-Type": "application/json"})
+        return self._send(req, (params.get("timeout") or 0) + 15)
+
+    def upload(self, method, field, filename, blob, ctype, **params):
+        boundary = uuid.uuid4().hex.encode()
+        parts = []
+        for k, v in params.items():
+            if v is None:
+                continue
+            v = v if isinstance(v, str) else json.dumps(v)
+            parts.append(b"--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"
+                         % (boundary, k.encode(), v.encode()))
+        parts.append(b"--%s\r\nContent-Disposition: form-data; name=\"%s\"; filename=\"%s\"\r\n"
+                     b"Content-Type: %s\r\n\r\n" % (boundary, field.encode(),
+                                                    filename.encode(), ctype.encode())
+                     + blob + b"\r\n")
+        parts.append(b"--%s--\r\n" % boundary)
+        req = urllib.request.Request(
+            "%s/bot%s/%s" % (self.base, self.token, method), data=b"".join(parts),
+            headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary.decode()})
+        return self._send(req, 60)
+
+    def download(self, file_id, limit):
+        info = self.call("getFile", file_id=file_id)
+        if (info.get("file_size") or 0) > limit:
+            raise TelegramError("file too big", code="too_big")
+        req = urllib.request.Request("%s/file/bot%s/%s" % (self.base, self.token,
+                                                           info["file_path"]))
+        with urllib.request.urlopen(req, timeout=60) as res:
+            blob = res.read(limit + 1)
+        if len(blob) > limit:
+            raise TelegramError("file too big", code="too_big")
+        return blob
+
+    def _send(self, req, timeout):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as res:
+                data = json.loads(res.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            try:
+                data = json.loads(e.read() or b"{}")
+            except ValueError:
+                data = {"ok": False, "error_code": e.code, "description": "HTTP %d" % e.code}
+        if not data.get("ok"):
+            raise TelegramError(data.get("description") or "telegram refused",
+                                data.get("error_code"),
+                                (data.get("parameters") or {}).get("retry_after"))
+        return data.get("result")
+
+
+# ------------------------------------------------------------------- helpers
+MENU_ACCOUNT = "👤 حساب من"
+MENU_BUY = "🛒 خرید / تمدید"
+MENU_IP = "🌐 ثبت آی‌پی"
+MENU_DNS = "📡 آدرس DNS"
+MENU_HELP = "❓ راهنما"
+MENU_ADMIN = "🛠 مدیریت"
+MENU_CANCEL = "انصراف"
+MENU_ACTIONS = {MENU_ACCOUNT: "account", MENU_BUY: "buy", MENU_IP: "ip",
+                MENU_DNS: "dns", MENU_HELP: "help", MENU_ADMIN: "admin_home"}
+
+STATUS = {"active": "✅ فعال", "pending": "⏳ در انتظار خرید پلن",
+          "over_quota": "⛔️ حجم تمام شده", "expired": "⌛️ دوره تمام شده",
+          "suspended": "🚫 مسدود"}
+
+PLAN_FORMAT = ("پلن را در یک خط بفرستید، بخش‌ها با | جدا:\n"
+               "نام | حجم (گیگ) | مدت (روز) | سرعت (مگابیت) | قیمت (تومان)\n\n"
+               "مثال:\nیک‌ماهه ۵۰ گیگ | 50 | 30 | 0 | 150000\n\n"
+               "حجم ۰ یعنی نامحدود، روز ۰ یعنی بدون محدودیت زمان، سرعت ۰ یعنی بی‌حد.")
+
+
+def btn(text, data):
+    return {"text": text, "callback_data": data}
+
+
+def kb(*rows):
+    return {"inline_keyboard": [list(r) for r in rows if r]}
+
+
+def cancel_kb():
+    return kb([btn("انصراف", "cancel")])
+
+
+def number(text):
+    """A number as somebody typed it, in any digits, with or without commas."""
+    return float((text or "").translate(DIGITS).replace(",", "").strip())
+
+
+def ago(**kw):
+    return (datetime.now(timezone.utc) - timedelta(**kw)).isoformat(timespec="seconds")
+
+
+def format_card(digits):
+    # Isolated left-to-right, or a Persian line around it reorders the groups.
+    return "⁦%s⁩" % " ".join(digits[i:i + 4] for i in range(0, len(digits), 4))
+
+
+def mask(token):
+    return (token[:6] + "…" + token[-4:]) if len(token) > 12 else "…"
+
+
+def typed_ip(text, own=()):
+    """An address somebody typed: (address, "") or ("", why). The same rules as
+    the relay's page, which is where the other way of typing one lives."""
+    text = (text or "").translate(DIGITS).strip()
+    try:
+        addr = ipaddress.IPv4Address(text)
+    except ValueError:
+        return "", "این آی‌پی درست نیست — چهار عدد با نقطه، مثل 5.123.45.67"
+    if not addr.is_global or addr.is_multicast:
+        return "", ("این آی‌پی عمومی نیست. آی‌پی اینترنت خود را بنویسید، نه آی‌پی "
+                    "داخل شبکهٔ خانه (مثل 192.168...)")
+    if str(addr) in own:
+        return "", "این آی‌پی مال سرورهای خود سرویس است"
+    return str(addr), ""
+
+
+def parse_plan(text):
+    parts = [x.strip() for x in (text or "").split("|")]
+    if len(parts) != 5:
+        return None, "باید پنج بخش باشد که با | از هم جدا شده‌اند."
+    name = parts[0]
+    if not 1 <= len(name) <= 40:
+        return None, "نام پلن باید ۱ تا ۴۰ نویسه باشد."
+    try:
+        gb, days, mbps, price = (number(x) for x in parts[1:])
+    except ValueError:
+        return None, "حجم، روز، سرعت و قیمت باید عدد باشند."
+    if min(gb, days, mbps) < 0 or days != int(days):
+        return None, "حجم، روز و سرعت نمی‌توانند منفی باشند و روز باید عدد صحیح باشد."
+    if price < 1000 or price != int(price):
+        return None, "قیمت باید عدد صحیح و دست‌کم ۱٬۰۰۰ تومان باشد."
+    return {"name": name, "quota_gb": gb, "days": int(days),
+            "speed_mbps": mbps, "price": int(price)}, ""
+
+
+def days_left(stamp):
+    due = P.parse_ts(stamp)
+    if not due:
+        return (stamp or "")[:10]
+    left = max(0, (due - datetime.now(timezone.utc)).days)
+    return "%s (%d روز مانده)" % (stamp[:10], left)
+
+
+# ----------------------------------------------------------------------- bot
+class Bot:
+    def __init__(self, store, tg, relays=()):
+        self.store = store
+        self.tg = tg
+        self.relays = tuple(relays)
+        # What the next message from a chat answers: ("receipt", plan_id),
+        # ("ip",), ("admin-quota", user_id)... In memory: a restart forgets a
+        # half-finished question, which costs somebody pressing a button again.
+        self.state = {}
+        self.throttle = P.Throttle()
+        self.stopped = False
+
+    # -- lifecycle --------------------------------------------------------
+    def start(self):
+        threading.Thread(target=self.sender, daemon=True).start()
+
+    def stop(self):
+        self.stopped = True
+
+    def sender(self):
+        """Deliver the outbox, forward new receipts, settle decisions.
+
+        A thread of its own so a broadcast to a thousand customers does not
+        hold up the next person pressing a button.
+        """
+        pruned = 0
+        while not self.stopped:
+            busy = 0
+            for job in (self.forward_receipts, self.drain, self.settle):
+                try:
+                    busy += job() or 0
+                except Exception as e:
+                    P.log(P.WARN, "bot: %s failed: %s" % (job.__name__, e))
+            if time.time() - pruned > 3600:
+                pruned = time.time()
+                try:
+                    self.store.run("DELETE FROM outbox WHERE created_at < ?", (ago(days=14),))
+                except Exception as e:
+                    P.log(P.WARN, "bot: outbox not pruned: %s" % e)
+            time.sleep(0.5 if busy else 3)
+
+    def settle(self):
+        P.settle_transactions(self.store)
+        return 0
+
+    def drain(self, limit=25):
+        """Send what is queued, a batch at a time, inside Telegram's rate limit."""
+        rows = self.store.q("SELECT * FROM outbox WHERE sent_at IS NULL AND attempts < 5"
+                            " ORDER BY id LIMIT ?", (limit,))
+        sent = 0
+        for r in rows:
+            if self.stopped:
+                break
+            try:
+                self.say(r["chat_id"], r["text"])
+                self.store.run("UPDATE outbox SET sent_at = ? WHERE id = ?", (P.now(), r["id"]))
+                sent += 1
+            except TelegramError as e:
+                if e.retry_after:
+                    time.sleep(min(int(e.retry_after), 30))
+                    break
+                # 403 is a customer who blocked the bot, 400 a chat that never
+                # existed: neither gets better by asking again.
+                gone = e.code in (400, 403)
+                self.store.run("UPDATE outbox SET attempts = CASE WHEN ? THEN 5"
+                               " ELSE attempts + 1 END WHERE id = ?", (gone, r["id"]))
+            except Exception as e:
+                P.log(P.WARN, "bot: telegram unreachable while sending: %s" % e)
+                break
+            time.sleep(0.04)
+        return sent
+
+    # -- sending ----------------------------------------------------------
+    def say(self, chat, text, markup=None):
+        return self.tg.call("sendMessage", chat_id=chat, text=text[:4096],
+                            reply_markup=markup, disable_web_page_preview=True)
+
+    def menu(self, chat):
+        rows = [[MENU_ACCOUNT, MENU_BUY], [MENU_IP, MENU_DNS], [MENU_HELP]]
+        if self.is_admin(chat):
+            rows.append([MENU_ADMIN])
+        return {"keyboard": [[{"text": t} for t in r] for r in rows],
+                "resize_keyboard": True}
+
+    def is_admin(self, chat):
+        return chat in P.bot_admins(self.store)
+
+    def setting(self, key):
+        return self.store.setting(key, "")
+
+    # -- updates ----------------------------------------------------------
+    def handle(self, update):
+        if "callback_query" in update:
+            return self.on_callback(update["callback_query"])
+        msg = update.get("message") or {}
+        chat = msg.get("chat") or {}
+        frm = msg.get("from") or {}
+        # Private chats only: an account is a person, and a group would show
+        # everybody's quota and card number to everybody.
+        if chat.get("type") != "private" or frm.get("is_bot") or not frm.get("id"):
+            return
+        chat_id = chat["id"]
+        user = self.customer(frm)
+        text = (msg.get("text") or "").strip()
+        if text.startswith("/start"):
+            self.state.pop(chat_id, None)
+            return self.welcome(chat_id, user)
+        if text.startswith("/admin"):
+            self.state.pop(chat_id, None)
+            return self.admin_command(chat_id, text)
+        if text in ("/cancel", MENU_CANCEL):
+            self.state.pop(chat_id, None)
+            return self.say(chat_id, "باشد، لغو شد.", self.menu(chat_id))
+        if text in MENU_ACTIONS:
+            self.state.pop(chat_id, None)
+            return getattr(self, MENU_ACTIONS[text])(chat_id, user)
+        waiting = self.state.get(chat_id)
+        if waiting:
+            return self.answer(chat_id, user, msg, waiting)
+        if msg.get("photo") or msg.get("document"):
+            return self.say(chat_id, "برای فرستادن رسید، اول از «🛒 خرید / تمدید» پلن "
+                                     "و روش کارت به کارت را انتخاب کنید.", self.menu(chat_id))
+        return self.say(chat_id, "از دکمه‌های پایین صفحه انتخاب کنید.", self.menu(chat_id))
+
+    def customer(self, frm):
+        """The account behind a Telegram user, opened the first time they write.
+
+        It starts the way a web signup does - pending, with nothing - and
+        becomes able to connect when a plan is bought or an operator gives it
+        one. The Telegram username is not stored as the account's username:
+        that column is what the web panel signs in with, and a handle somebody
+        else can take later is no login name.
+        """
+        user = self.store.user_by_telegram(int(frm["id"]))
+        if user:
+            return user
+        name = " ".join(x for x in (frm.get("first_name"), frm.get("last_name")) if x)
+        user = self.store.create_user(int(frm["id"]), None, name.strip()[:60])
+        P.log(P.INFO, "bot: new account #%d from telegram" % user["id"])
+        handle = frm.get("username")
+        P.tell_admins(self.store, "🆕 مشتری تازه در ربات: %s%s"
+                      % (P.user_label(user), (" @" + handle) if handle else ""))
+        return user
+
+    def on_callback(self, cq):
+        data = cq.get("data") or ""
+        msg = cq.get("message") or {}
+        chat = msg.get("chat") or {}
+        frm = cq.get("from") or {}
+        try:
+            self.tg.call("answerCallbackQuery", callback_query_id=cq.get("id"))
+        except Exception:
+            pass
+        if chat.get("type") != "private" or not frm.get("id"):
+            return
+        chat_id = chat["id"]
+        user = self.customer(frm)
+        if data == "cancel":
+            self.state.pop(chat_id, None)
+            return self.say(chat_id, "باشد، لغو شد.", self.menu(chat_id))
+        if data == "buy":
+            return self.buy(chat_id, user)
+        if data == "ip":
+            return self.ip(chat_id, user)
+        if data == "typeip":
+            self.state[chat_id] = ("ip",)
+            return self.say(chat_id, "آی‌پی اینترنت خود را بفرستید (مثل 5.123.45.67).",
+                            cancel_kb())
+        kind, _, arg = data.partition(":")
+        if kind == "plan" and arg.isdigit():
+            return self.pick_plan(chat_id, int(arg))
+        if kind == "card" and arg.isdigit():
+            return self.card(chat_id, user, int(arg))
+        if kind == "zp" and arg.isdigit():
+            return self.online(chat_id, user, int(arg))
+        if kind == "a":
+            if not self.is_admin(chat_id):
+                return self.say(chat_id, "این بخش فقط برای مدیر ربات است.")
+            return self.admin_callback(chat_id, msg, arg)
+
+    def answer(self, chat, user, msg, waiting):
+        kind = waiting[0]
+        text = (msg.get("text") or "").strip()
+        if kind == "receipt":
+            return self.receive_receipt(chat, user, msg, waiting[1])
+        if kind == "ip":
+            return self.receive_ip(chat, user, text)
+        if kind.startswith("admin-"):
+            if not self.is_admin(chat):
+                self.state.pop(chat, None)
+                return
+            return self.admin_answer(chat, text, waiting)
+        self.state.pop(chat, None)
+
+    # -- customers --------------------------------------------------------
+    def welcome(self, chat, user):
+        self.say(chat, "سلام %s 👋\n\nاز این ربات می‌توانید:\n"
+                       "• پلن بخرید یا تمدید کنید\n"
+                       "• آی‌پی اینترنتتان را ثبت کنید\n"
+                       "• حجم باقی‌مانده و وضعیت حسابتان را ببینید\n\n"
+                       "از دکمه‌های پایین شروع کنید."
+                 % (user["first_name"] or "دوست عزیز"), self.menu(chat))
+
+    def account(self, chat, user):
+        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+        self.say(chat, self.account_text(user),
+                 kb([btn("🛒 خرید / تمدید", "buy"), btn("🌐 ثبت آی‌پی", "ip")]))
+
+    def account_text(self, user, admin=False):
+        ips = self.store.user_ips(user["id"])
+        quota, used = user["quota_bytes"], user["used_bytes"]
+        lines = ["👤 %s" % (user["first_name"] or user["username"] or "حساب شما")]
+        if admin:
+            lines.append("شناسه: #%d%s%s" % (
+                user["id"], ("  · وب: %s" % user["username"]) if user["username"] else "",
+                ("  · تلگرام: %s" % user["telegram_id"]) if user["telegram_id"] else ""))
+            tpl = (self.store.one("SELECT name FROM templates WHERE id = ?",
+                                  (user["template_id"],)) if user["template_id"] else None)
+            lines.append("قالب: %s" % (tpl["name"] if tpl else "پیش‌فرض"))
+        lines.append("وضعیت: %s" % STATUS.get(user["status"], user["status"]))
+        last = self.store.one(
+            "SELECT p.name FROM transactions t JOIN plans p ON p.id = t.plan_id"
+            " WHERE t.user_id = ? AND t.status = 'approved'"
+            " ORDER BY t.decided_at DESC LIMIT 1", (user["id"],))
+        if last:
+            lines.append("پلن: %s" % last["name"])
+        lines.append("آی‌پی ثبت‌شده: %s" % (ips[0]["ip"] if ips else "ثبت نشده"))
+        lines.append("مصرف: %s" % P.human_fa(used))
+        if quota:
+            lines.append("حجم: %s · باقی‌مانده: %s"
+                         % (P.human_fa(quota), P.human_fa(max(0, quota - used))))
+        elif user["status"] != "pending":
+            lines.append("حجم: نامحدود")
+        if user["speed_kbps"]:
+            lines.append("سرعت: %g مگابیت بر ثانیه" % (user["speed_kbps"] / 1000.0))
+        if user["expires_at"]:
+            lines.append("پایان دوره: %s" % days_left(user["expires_at"]))
+        elif user["quota_reset_at"]:
+            lines.append("تمدید حجم: %s" % user["quota_reset_at"][:10])
+        if user["status"] == "pending" and not admin:
+            lines.append("\nبرای شروع، از «🛒 خرید / تمدید» یک پلن بخرید.")
+        elif not ips and not admin:
+            lines.append("\nآی‌پی‌تان هنوز ثبت نشده؛ تا ثبت نشود سرویس کار نمی‌کند.")
+        return "\n".join(lines)
+
+    def buy(self, chat, user):
+        plans = self.store.q("SELECT * FROM plans WHERE active = 1 ORDER BY price, id")
+        if not plans:
+            return self.say(chat, "هنوز پلنی برای فروش گذاشته نشده. کمی بعد دوباره سر بزنید.")
+        self.say(chat, "یک پلن انتخاب کنید:",
+                 kb(*[[btn(P.plan_summary(p), "plan:%d" % p["id"])] for p in plans]))
+
+    def pick_plan(self, chat, plan_id):
+        plan = self.store.one("SELECT * FROM plans WHERE id = ? AND active = 1", (plan_id,))
+        if not plan:
+            return self.say(chat, "این پلن دیگر فروخته نمی‌شود.")
+        rows = []
+        if self.setting("card_number"):
+            rows.append([btn("💳 کارت به کارت", "card:%d" % plan_id)])
+        if self.setting("zarinpal_merchant") and self.setting("relay_panel"):
+            rows.append([btn("🔐 پرداخت آنلاین (زرین‌پال)", "zp:%d" % plan_id)])
+        if not rows:
+            return self.say(chat, "هنوز روش پرداختی تنظیم نشده. لطفاً با پشتیبانی تماس بگیرید.")
+        self.say(chat, "پلن انتخابی:\n%s\n\nروش پرداخت را انتخاب کنید:"
+                 % P.plan_summary(plan), kb(*rows))
+
+    def card(self, chat, user, plan_id):
+        plan = self.store.one("SELECT * FROM plans WHERE id = ? AND active = 1", (plan_id,))
+        number_ = self.setting("card_number")
+        if not plan or not number_:
+            return self.say(chat, "این روش پرداخت الان در دسترس نیست.")
+        holder = self.setting("card_holder")
+        self.state[chat] = ("receipt", plan["id"])
+        self.say(chat, "مبلغ %s را به این کارت واریز کنید:\n\n%s\n%s\n"
+                       "بعد، عکس رسید (یا فایل PDF آن) را همین‌جا بفرستید."
+                 % (P.toman(plan["price"]), format_card(number_),
+                    ("به نام %s\n" % holder) if holder else ""), cancel_kb())
+
+    def online(self, chat, user, plan_id):
+        plan = self.store.one("SELECT * FROM plans WHERE id = ? AND active = 1", (plan_id,))
+        base = self.setting("relay_panel")
+        if not plan or not base or not self.setting("zarinpal_merchant"):
+            return self.say(chat, "پرداخت آنلاین الان در دسترس نیست.")
+        token = secrets.token_urlsafe(24)
+        self.store.run(
+            "INSERT INTO transactions (user_id, amount, kind, plan_id, status,"
+            " created_at, pay_token, note) VALUES (?, ?, 'zarinpal', ?, 'started', ?, ?,"
+            " 'telegram')", (user["id"], int(plan["price"]), plan["id"], P.now(), token))
+        self.say(chat, "پلن: %s\nمبلغ: %s\n\nبرای پرداخت روی دکمه بزنید. لینک تا ۲۴ ساعت "
+                       "معتبر است؛ بعد از پرداخت، پلن خودکار فعال می‌شود و همین‌جا خبرتان "
+                       "می‌کنیم." % (plan["name"], P.toman(plan["price"])),
+                 kb([{"text": "🔐 پرداخت %s" % P.toman(plan["price"]),
+                      "url": "%s/pay/%s" % (base, token)}]))
+
+    def receive_receipt(self, chat, user, msg, plan_id):
+        file_id = ctype = None
+        if msg.get("photo"):
+            file_id, ctype = msg["photo"][-1]["file_id"], "image/jpeg"
+        elif msg.get("document"):
+            ctype = (msg["document"].get("mime_type") or "").lower()
+            if ctype in RECEIPT_TYPES:
+                file_id = msg["document"]["file_id"]
+        if not file_id:
+            return self.say(chat, "لطفاً عکس رسید را بفرستید (عکس، یا فایل JPG، PNG، WEBP "
+                                  "یا PDF). برای لغو «انصراف» را بزنید.", cancel_kb())
+        plan = self.store.one("SELECT * FROM plans WHERE id = ?", (plan_id,))
+        if not plan:
+            self.state.pop(chat, None)
+            return self.say(chat, "این پلن دیگر فروخته نمی‌شود.", self.menu(chat))
+        try:
+            blob = self.tg.download(file_id, P.MAX_RECEIPT)
+        except TelegramError as e:
+            if e.code == "too_big":
+                return self.say(chat, "فایل بزرگ‌تر از %s است؛ عکس کوچک‌تری بفرستید."
+                                % P.human(P.MAX_RECEIPT), cancel_kb())
+            raise
+        self.state.pop(chat, None)
+        # One pending receipt per customer, as on the web: a second one replaces
+        # the first, because somebody who sends three photos means the last.
+        self.store.run("DELETE FROM transactions WHERE user_id = ? AND status = 'pending'",
+                       (user["id"],))
+        self.store.run(
+            "INSERT INTO transactions (user_id, amount, kind, plan_id, receipt_blob,"
+            " receipt_type, note, status, created_at, admin_notified)"
+            " VALUES (?, ?, 'card', ?, ?, ?, 'telegram', 'pending', ?, 0)",
+            (user["id"], int(plan["price"]), plan["id"], blob, ctype, P.now()))
+        P.log(P.INFO, "bot: receipt from user %d for plan %d, %s"
+              % (user["id"], plan["id"], P.human(len(blob))))
+        self.say(chat, "✅ رسید دریافت شد.\nپس از بررسی، پلن «%s» فعال می‌شود و همین‌جا "
+                       "خبرتان می‌کنیم." % plan["name"], self.menu(chat))
+        self.forward_receipts()
+
+    def ip(self, chat, user):
+        base = self.setting("relay_panel")
+        rows = []
+        text = "آی‌پی اینترنتی را ثبت کنید که سرویس باید رویش کار کند.\n\n"
+        if base:
+            rows.append([{"text": "🌐 ثبت خودکار آی‌پی", "web_app": {"url": base + "/tg"}}])
+            text += ("روش ساده: فیلترشکن (VPN) را خاموش کنید، با همان اینترنت (وای‌فای "
+                     "خانه یا اینترنت گوشی) وصل شوید و «ثبت خودکار آی‌پی» را بزنید.\n\n")
+        rows.append([btn("⌨️ آی‌پی را خودم می‌نویسم", "typeip")])
+        text += "اگر آی‌پی‌تان را می‌دانید، می‌توانید خودتان هم بنویسید."
+        self.say(chat, text, kb(*rows))
+
+    def receive_ip(self, chat, user, text):
+        own = set(self.relays) | {self.setting("relay_dns")}
+        ip, why = typed_ip(text, own)
+        if not ip:
+            return self.say(chat, why + "\nدوباره بفرستید یا «انصراف» را بزنید.", cancel_kb())
+        self.state.pop(chat, None)
+        res = self.store.claim_ip(user["id"], ip)
+        if res.get("ok"):
+            P.log(P.INFO, "bot: user %d registered %s by hand" % (user["id"], ip))
+        self.say(chat, ("✅ " if res.get("ok") else "⚠️ ") + res.get("message", ""),
+                 self.menu(chat))
+
+    def dns(self, chat, user):
+        address = self.setting("relay_dns") or (self.relays[0] if self.relays else "")
+        if not address:
+            return self.say(chat, "آدرس DNS هنوز معلوم نیست؛ کمی بعد دوباره امتحان کنید.")
+        self.say(chat, "📡 آدرس DNS:\n\n%s\n\nاین را در تنظیمات شبکهٔ کنسول، گوشی یا مودم "
+                       "به‌عنوان DNS اول بگذارید. اگر DNS دوم هم می‌خواهد، همین آدرس را "
+                       "دوباره بنویسید — آدرس دیگری آنجا باعث می‌شود سرویس گاهی کار کند و "
+                       "گاهی نه.\n\nآی‌پی اینترنتتان هم باید ثبت شده باشد." % address)
+
+    def help(self, chat, user):
+        self.say(chat, "❓ راه‌اندازی در سه قدم:\n\n"
+                       "۱. از «🛒 خرید / تمدید» یک پلن بخرید.\n"
+                       "۲. از «🌐 ثبت آی‌پی» آی‌پی اینترنتی را ثبت کنید که سرویس رویش "
+                       "کار می‌کند. اگر مودم را ریست کردید یا اینترنت عوض شد، دوباره "
+                       "ثبت کنید.\n"
+                       "۳. از «📡 آدرس DNS» آدرس را بگیرید و در کنسول، گوشی یا مودم "
+                       "بگذارید.\n\n"
+                       "حجم و زمان باقی‌مانده را در «👤 حساب من» ببینید.", self.menu(chat))
+
+    # -- admin ------------------------------------------------------------
+    def admin_command(self, chat, text):
+        parts = text.split()
+        if len(parts) >= 2:
+            return self.claim_admin(chat, parts[1])
+        if self.is_admin(chat):
+            return self.admin_home(chat, None)
+        return self.say(chat, "برای مدیر ربات شدن، کد مدیریت را از تنظیمات پنل مدیریت "
+                              "بگیرید و این‌طور بفرستید:\n/admin کد")
+
+    def claim_admin(self, chat, code):
+        key = "admin:%d" % chat
+        ok, wait = self.throttle.check(key, limit=5, window=900)
+        if not ok:
+            return self.say(chat, "تلاش زیاد بوده. %d دقیقه دیگر." % max(1, wait // 60))
+        stored, _, until = self.setting("bot_admin_code").partition("|")
+        due = P.parse_ts(until)
+        if (not stored or not due or due < datetime.now(timezone.utc)
+                or not hmac.compare_digest(stored, code.strip().lower())):
+            self.throttle.hit(key)
+            P.log(P.WARN, "bot: a wrong admin code from telegram %d" % chat)
+            return self.say(chat, "این کد درست نیست یا منقضی شده. از پنل مدیریت کد تازه بگیرید.")
+        admins = P.bot_admins(self.store)
+        if chat not in admins:
+            admins.append(chat)
+        self.store.set_setting("bot_admins", ",".join(str(a) for a in admins))
+        # One use. Whoever sees the code in the admin panel after this cannot
+        # turn it into a second admin.
+        self.store.set_setting("bot_admin_code", "")
+        self.throttle.clear(key)
+        P.log(P.INFO, "bot: telegram %d is now a bot admin" % chat)
+        self.say(chat, "✅ شما مدیر ربات شدید. دکمهٔ «🛠 مدیریت» به منو اضافه شد.",
+                 self.menu(chat))
+
+    def admin_home(self, chat, user):
+        if not self.is_admin(chat):
+            return self.say(chat, "این بخش فقط برای مدیر ربات است.", self.menu(chat))
+        pending = self.store.one("SELECT count(*) c FROM transactions"
+                                 " WHERE status = 'pending' AND receipt_blob IS NOT NULL")["c"]
+        self.say(chat, "🛠 مدیریت", kb(
+            [btn("📥 رسیدها (%d)" % pending, "a:rc"), btn("👥 کاربران", "a:us")],
+            [btn("📦 پلن‌ها", "a:pl"), btn("💳 روش‌های پرداخت", "a:py")],
+            [btn("📊 آمار", "a:st"), btn("📢 پیام همگانی", "a:bc")]))
+
+    def ask(self, chat, state, text):
+        self.state[chat] = state
+        return self.say(chat, text, cancel_kb())
+
+    def admin_callback(self, chat, msg, arg):
+        parts = arg.split(":")
+        cmd = parts[0]
+        ids = [int(x) for x in parts[1:] if x.isdigit()]
+        pages = {"rc": self.admin_receipts, "us": self.admin_users, "pl": self.admin_plans,
+                 "py": self.admin_payments, "st": self.admin_stats}
+        if cmd in pages:
+            return pages[cmd](chat)
+        if cmd in ("ok", "no") and ids:
+            return self.decide(chat, msg, ids[0], "approved" if cmd == "ok" else "rejected")
+        if cmd == "uf":
+            return self.ask(chat, ("admin-find",), "نام، نام کاربری، شناسه، آیدی عددی تلگرام "
+                                                   "یا آی‌پی را بفرستید:")
+        if cmd == "ul" and len(parts) == 2:
+            return self.list_users(chat, parts[1])
+        if cmd == "u" and ids:
+            return self.user_card(chat, ids[0])
+        if cmd == "up" and ids:
+            return self.choose_plan_for(chat, ids[0])
+        if cmd == "upp" and len(ids) == 2:
+            return self.grant_plan(chat, ids[0], ids[1])
+        if cmd in ("uq", "ud", "uv") and ids:
+            state, text = {
+                "uq": ("admin-quota", "حجم را به گیگابایت بفرستید (۰ یعنی نامحدود):"),
+                "ud": ("admin-days", "از امروز چند روز؟ (۰ یعنی بدون محدودیت زمان)"),
+                "uv": ("admin-speed", "سقف سرعت دانلود به مگابیت بر ثانیه (۰ یعنی بی‌حد):"),
+            }[cmd]
+            return self.ask(chat, (state, ids[0]), text)
+        if cmd == "ut" and ids:
+            return self.choose_template(chat, "utt", ids[0], allow_none=False)
+        if cmd == "utt" and len(ids) == 2:
+            if self.store.one("SELECT 1 FROM templates WHERE id = ?", (ids[1],)):
+                self.store.run("UPDATE users SET template_id = ? WHERE id = ?",
+                               (ids[1], ids[0]))
+                self.say(chat, "✅ قالب عوض شد؛ تا ۳۰ ثانیه دیگر روی رله‌ها اعمال می‌شود.")
+            return self.user_card(chat, ids[0])
+        if cmd == "ur" and ids:
+            P.reset_user_usage(self.store, ids[0])
+            self.say(chat, "✅ مصرف صفر شد.")
+            return self.user_card(chat, ids[0])
+        if cmd in ("ux", "ua") and ids:
+            P.set_user_status(self.store, ids[0], "suspended" if cmd == "ux" else "active")
+            self.say(chat, "🚫 مسدود شد؛ تا ۳۰ ثانیه دیگر قطع می‌شود." if cmd == "ux"
+                     else "✅ حساب برگشت.")
+            return self.user_card(chat, ids[0])
+        if cmd == "pn":
+            return self.ask(chat, ("admin-plan-new",), PLAN_FORMAT)
+        if cmd == "p" and ids:
+            return self.plan_card(chat, ids[0])
+        if cmd == "pe" and ids:
+            plan = self.store.one("SELECT * FROM plans WHERE id = ?", (ids[0],))
+            if not plan:
+                return self.say(chat, "این پلن پیدا نشد.")
+            return self.ask(chat, ("admin-plan-edit", ids[0]), PLAN_FORMAT + "\n\nالان:\n%s | %g | %d | %g | %d"
+                            % (plan["name"], plan["quota_gb"], plan["days"],
+                               plan["speed_mbps"], plan["price"]))
+        if cmd == "pt" and ids:
+            return self.choose_template(chat, "ptt", ids[0], allow_none=True)
+        if cmd == "ptt" and len(ids) == 2:
+            self.store.run("UPDATE plans SET template_id = NULLIF(?, 0) WHERE id = ?",
+                           (ids[1], ids[0]))
+            return self.plan_card(chat, ids[0])
+        if cmd == "pa" and ids:
+            self.store.run("UPDATE plans SET active = 1 - active WHERE id = ?", (ids[0],))
+            return self.plan_card(chat, ids[0])
+        if cmd == "pd" and ids:
+            if self.store.one("SELECT 1 FROM transactions WHERE plan_id = ?", (ids[0],)):
+                self.store.run("UPDATE plans SET active = 0 WHERE id = ?", (ids[0],))
+                self.say(chat, "این پلن در سفارش‌ها استفاده شده، پس فقط فروشش متوقف شد.")
+            else:
+                self.store.run("DELETE FROM plans WHERE id = ?", (ids[0],))
+                self.say(chat, "🗑 پلن حذف شد.")
+            return self.admin_plans(chat)
+        if cmd == "pc":
+            return self.ask(chat, ("admin-card",), "شمارهٔ کارت و نام صاحب کارت را این‌طور "
+                                                   "بفرستید:\n6037 9912 3456 7890 | علی رضایی")
+        if cmd == "pz":
+            return self.ask(chat, ("admin-merchant",), "مرچنت کد ۳۶ نویسه‌ای زرین‌پال را بفرستید:")
+        if cmd == "pcx":
+            self.store.set_setting("card_number", "")
+            self.store.set_setting("card_holder", "")
+            return self.admin_payments(chat)
+        if cmd == "pzx":
+            self.store.set_setting("zarinpal_merchant", "")
+            return self.admin_payments(chat)
+        if cmd == "bc":
+            return self.ask(chat, ("admin-bc",), "متن پیام همگانی را بفرستید:")
+        if cmd == "bcy":
+            waiting = self.state.get(chat)
+            if not waiting or waiting[0] != "admin-bc-confirm":
+                return self.say(chat, "پیامی برای ارسال آماده نیست.")
+            self.state.pop(chat, None)
+            cur = self.store.run(
+                "INSERT INTO outbox (chat_id, text, created_at) SELECT telegram_id, ?, ?"
+                " FROM users WHERE telegram_id IS NOT NULL", (waiting[1], P.now()))
+            P.log(P.INFO, "bot: broadcast to %d accounts by telegram %d" % (cur.rowcount, chat))
+            return self.say(chat, "📢 در صف ارسال: %d پیام. کمی طول می‌کشد." % cur.rowcount,
+                            self.menu(chat))
+
+    def admin_answer(self, chat, text, waiting):
+        kind = waiting[0]
+        if kind == "admin-find":
+            self.state.pop(chat, None)
+            return self.find_users(chat, text)
+        if kind in ("admin-quota", "admin-days", "admin-speed"):
+            uid = waiting[1]
+            try:
+                value = number(text)
+            except ValueError:
+                return self.say(chat, "یک عدد بفرستید.", cancel_kb())
+            if value < 0:
+                return self.say(chat, "عدد منفی نمی‌شود.", cancel_kb())
+            self.state.pop(chat, None)
+            if not self.store.one("SELECT 1 FROM users WHERE id = ?", (uid,)):
+                return self.say(chat, "این کاربر پیدا نشد.")
+            joined = False
+            if kind == "admin-quota":
+                joined, done = P.set_user_quota(self.store, uid, value), "حجم ذخیره شد"
+            elif kind == "admin-days":
+                joined, done = P.set_user_days(self.store, uid, value), "مدت ذخیره شد"
+            else:
+                P.set_user_speed(self.store, uid, value)
+                done = "سرعت ذخیره شد"
+            self.say(chat, "✅ %s%s" % (done, "؛ حساب فعال شد" if joined else ""))
+            return self.user_card(chat, uid)
+        if kind in ("admin-plan-new", "admin-plan-edit"):
+            plan, why = parse_plan(text)
+            if not plan:
+                return self.say(chat, "⚠️ %s\n\n%s" % (why, PLAN_FORMAT), cancel_kb())
+            self.state.pop(chat, None)
+            values = (plan["name"], plan["quota_gb"], plan["days"], plan["speed_mbps"],
+                      plan["price"])
+            if kind == "admin-plan-new":
+                pid = self.store.run(
+                    "INSERT INTO plans (name, quota_gb, days, speed_mbps, price, active,"
+                    " created_at) VALUES (?, ?, ?, ?, ?, 1, ?)", values + (P.now(),)).lastrowid
+                self.say(chat, "✅ پلن ساخته شد و در فروش است.")
+            else:
+                pid = waiting[1]
+                self.store.run("UPDATE plans SET name = ?, quota_gb = ?, days = ?,"
+                               " speed_mbps = ?, price = ? WHERE id = ?", values + (pid,))
+                self.say(chat, "✅ پلن ویرایش شد.")
+            return self.plan_card(chat, pid)
+        if kind == "admin-card":
+            first, _, holder = text.partition("|")
+            digits = re.sub(r"[\s-]", "", first.translate(DIGITS))
+            if not re.fullmatch(r"\d{16}", digits):
+                return self.say(chat, "شمارهٔ کارت باید ۱۶ رقم باشد. دوباره بفرستید:", cancel_kb())
+            self.state.pop(chat, None)
+            self.store.set_setting("card_number", digits)
+            self.store.set_setting("card_holder", holder.strip()[:60])
+            self.say(chat, "✅ کارت ذخیره شد.")
+            return self.admin_payments(chat)
+        if kind == "admin-merchant":
+            merchant = text.strip()
+            if not re.fullmatch(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", merchant):
+                return self.say(chat, "مرچنت کد زرین‌پال ۳۶ نویسه است، مثل "
+                                      "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx. دوباره بفرستید:",
+                                cancel_kb())
+            self.state.pop(chat, None)
+            self.store.set_setting("zarinpal_merchant", merchant)
+            self.say(chat, "✅ مرچنت ذخیره شد.")
+            return self.admin_payments(chat)
+        if kind in ("admin-bc", "admin-bc-confirm"):
+            if not text:
+                return self.say(chat, "یک پیام متنی بفرستید.", cancel_kb())
+            count = self.store.one("SELECT count(*) c FROM users"
+                                   " WHERE telegram_id IS NOT NULL")["c"]
+            self.state[chat] = ("admin-bc-confirm", text[:4000])
+            return self.say(chat, "پیش‌نمایش:\n\n%s" % text[:4000], kb(
+                [btn("📢 ارسال به %d نفر" % count, "a:bcy")], [btn("انصراف", "cancel")]))
+        self.state.pop(chat, None)
+
+    # receipts
+    def admin_receipts(self, chat):
+        rows = self.store.q("SELECT id FROM transactions WHERE status = 'pending'"
+                            " AND receipt_blob IS NOT NULL ORDER BY id LIMIT 10")
+        if not rows:
+            return self.say(chat, "رسید در انتظاری نیست.")
+        for r in rows:
+            self.send_receipt(chat, r["id"])
+
+    def forward_receipts(self):
+        """Show each new receipt to every bot admin, once."""
+        admins = P.bot_admins(self.store)
+        if not admins:
+            return 0
+        rows = self.store.q("SELECT id FROM transactions WHERE status = 'pending'"
+                            " AND admin_notified = 0 AND receipt_blob IS NOT NULL"
+                            " ORDER BY id LIMIT 10")
+        for r in rows:
+            if self.store.run("UPDATE transactions SET admin_notified = 1"
+                              " WHERE id = ? AND admin_notified = 0", (r["id"],)).rowcount != 1:
+                continue
+            for chat in admins:
+                try:
+                    self.send_receipt(chat, r["id"])
+                except Exception as e:
+                    P.log(P.WARN, "bot: receipt %d not shown to %d: %s" % (r["id"], chat, e))
+        return len(rows)
+
+    def send_receipt(self, chat, tid):
+        t = self.store.one("SELECT t.*, p.name AS plan_name FROM transactions t"
+                           " LEFT JOIN plans p ON p.id = t.plan_id WHERE t.id = ?", (tid,))
+        if not t or t["status"] != "pending" or not t["receipt_blob"]:
+            return
+        user = self.store.one("SELECT * FROM users WHERE id = ?", (t["user_id"],))
+        caption = "🧾 رسید #%d\nکاربر: %s\nپلن: %s\nمبلغ: %s\nزمان: %s UTC" % (
+            tid, P.user_label(user) if user else "#%d" % t["user_id"],
+            t["plan_name"] or "— (از پنل وب)",
+            P.toman(t["amount"]) if t["amount"] else "—",
+            (t["created_at"] or "")[:16].replace("T", " "))
+        markup = kb([btn("✅ تأیید", "a:ok:%d" % tid), btn("❌ رد", "a:no:%d" % tid)],
+                    [btn("👤 حساب کاربر", "a:u:%d" % t["user_id"])])
+        ctype = t["receipt_type"] or "application/octet-stream"
+        ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp",
+               "application/pdf": "pdf"}.get(ctype, "bin")
+        method, field = (("sendPhoto", "photo") if ctype in ("image/jpeg", "image/png")
+                         else ("sendDocument", "document"))
+        self.tg.upload(method, field, "receipt-%d.%s" % (tid, ext), bytes(t["receipt_blob"]),
+                       ctype, chat_id=str(chat), caption=caption, reply_markup=markup)
+
+    def decide(self, chat, msg, tid, to):
+        # Only a receipt still pending: two admins pressing at once, or one in
+        # the bot and one in the web panel, decide it once.
+        cur = self.store.run("UPDATE transactions SET status = ?, decided_at = ?,"
+                             " receipt_blob = NULL, settled = 0"
+                             " WHERE id = ? AND status = 'pending'", (to, P.now(), tid))
+        if cur.rowcount != 1:
+            return self.say(chat, "رسید #%d قبلاً بررسی شده." % tid)
+        P.settle_transactions(self.store)
+        t = self.store.one("SELECT t.*, p.name AS plan_name FROM transactions t"
+                           " LEFT JOIN plans p ON p.id = t.plan_id WHERE t.id = ?", (tid,))
+        P.log(P.INFO, "bot: receipt %d %s by telegram %d" % (tid, to, chat))
+        if to == "approved":
+            done = ("تأیید شد و پلن «%s» اعمال شد" % t["plan_name"] if t["plan_name"]
+                    else "تأیید شد؛ پلنی همراهش نبود، حجم و زمان را خودتان بگذارید")
+        else:
+            done = "رد شد"
+        try:
+            self.tg.call("editMessageReplyMarkup", chat_id=chat,
+                         message_id=msg.get("message_id"), reply_markup={"inline_keyboard": []})
+        except Exception:
+            pass
+        self.say(chat, "رسید #%d %s." % (tid, done),
+                 kb([btn("👤 حساب کاربر", "a:u:%d" % t["user_id"])]))
+        for other in P.bot_admins(self.store):
+            if other != chat:
+                P.queue_message(self.store, other, "رسید #%d را مدیر دیگری بررسی کرد: %s."
+                                % (tid, done))
+
+    # customers
+    def admin_users(self, chat):
+        counts = {r["status"]: r["c"] for r in self.store.q(
+            "SELECT status, count(*) c FROM users GROUP BY status")}
+        self.say(chat, "👥 کاربران: %d" % sum(counts.values()), kb(
+            [btn("🔎 جستجو", "a:uf")],
+            [btn("⏳ در انتظار (%d)" % counts.get("pending", 0), "a:ul:pending"),
+             btn("✅ فعال (%d)" % counts.get("active", 0), "a:ul:active")],
+            [btn("⛔️ تمام‌شده (%d)" % (counts.get("over_quota", 0) + counts.get("expired", 0)),
+                 "a:ul:ended"),
+             btn("🚫 مسدود (%d)" % counts.get("suspended", 0), "a:ul:suspended")]))
+
+    def list_users(self, chat, which):
+        where = {"pending": "status = 'pending'", "active": "status = 'active'",
+                 "ended": "status IN ('over_quota', 'expired')",
+                 "suspended": "status = 'suspended'"}.get(which)
+        if not where:
+            return
+        rows = self.store.q("SELECT * FROM users WHERE %s ORDER BY id DESC LIMIT 30" % where)
+        self.show_users(chat, rows)
+
+    def find_users(self, chat, text):
+        q = (text or "").translate(DIGITS).strip().lstrip("@#")
+        if not q:
+            return self.say(chat, "چیزی برای جستجو نفرستادید.")
+        num = int(q) if q.isdigit() else -1
+        like = "%" + q + "%"
+        rows = self.store.q(
+            "SELECT * FROM users WHERE id = ? OR telegram_id = ? OR username LIKE ?"
+            " OR first_name LIKE ? OR phone LIKE ?"
+            " OR id IN (SELECT user_id FROM ips WHERE ip = ?)"
+            " ORDER BY id DESC LIMIT 30", (num, num, like, like, like, q))
+        self.show_users(chat, rows)
+
+    def show_users(self, chat, rows):
+        if not rows:
+            return self.say(chat, "کسی پیدا نشد.")
+        if len(rows) == 1:
+            return self.user_card(chat, rows[0]["id"])
+        self.say(chat, "%d نفر:" % len(rows), kb(*[
+            [btn("%s · %s" % (P.user_label(u), STATUS.get(u["status"], u["status"])),
+                 "a:u:%d" % u["id"])] for u in rows]))
+
+    def user_card(self, chat, uid):
+        user = self.store.one("SELECT * FROM users WHERE id = ?", (uid,))
+        if not user:
+            return self.say(chat, "این کاربر پیدا نشد.")
+        blocked = user["status"] == "suspended"
+        self.say(chat, self.account_text(user, admin=True), kb(
+            [btn("📦 اعمال پلن", "a:up:%d" % uid), btn("♻️ صفر کردن مصرف", "a:ur:%d" % uid)],
+            [btn("📊 حجم", "a:uq:%d" % uid), btn("📅 روز", "a:ud:%d" % uid),
+             btn("🚀 سرعت", "a:uv:%d" % uid)],
+            [btn("🗂 قالب", "a:ut:%d" % uid),
+             btn("✅ برگرداندن" if blocked else "🚫 مسدود کردن",
+                 ("a:ua:%d" if blocked else "a:ux:%d") % uid)]))
+
+    def choose_plan_for(self, chat, uid):
+        plans = self.store.q("SELECT * FROM plans ORDER BY active DESC, price, id")
+        if not plans:
+            return self.say(chat, "هنوز پلنی ساخته نشده.")
+        self.say(chat, "کدام پلن روی این حساب اعمال شود؟ (از امروز، مصرف صفر می‌شود)", kb(*[
+            [btn(P.plan_summary(p), "a:upp:%d:%d" % (uid, p["id"]))] for p in plans]))
+
+    def grant_plan(self, chat, uid, pid):
+        plan = self.store.one("SELECT * FROM plans WHERE id = ?", (pid,))
+        user = self.store.one("SELECT * FROM users WHERE id = ?", (uid,))
+        if not plan or not user:
+            return self.say(chat, "پلن یا کاربر پیدا نشد.")
+        P.apply_plan(self.store, uid, plan)
+        P.tell_user(self.store, user, "🎁 پلن «%s» برای حساب شما فعال شد." % plan["name"])
+        P.log(P.INFO, "bot: plan %d given to user %d by telegram %d" % (pid, uid, chat))
+        self.say(chat, "✅ پلن «%s» اعمال شد." % plan["name"])
+        return self.user_card(chat, uid)
+
+    def choose_template(self, chat, cmd, target, allow_none):
+        rows = self.store.q("SELECT * FROM templates ORDER BY is_default DESC, id")
+        buttons = [[btn(t["name"] + (" (پیش‌فرض)" if t["is_default"] else ""),
+                        "a:%s:%d:%d" % (cmd, target, t["id"]))] for t in rows]
+        if allow_none:
+            buttons.append([btn("بدون تغییر قالب کاربر", "a:%s:%d:0" % (cmd, target))])
+        self.say(chat, "قالب را انتخاب کنید:", kb(*buttons))
+
+    # plans
+    def admin_plans(self, chat):
+        rows = self.store.q("SELECT * FROM plans ORDER BY active DESC, price, id")
+        buttons = [[btn(("" if p["active"] else "⏸ ") + P.plan_summary(p), "a:p:%d" % p["id"])]
+                   for p in rows]
+        buttons.append([btn("➕ پلن تازه", "a:pn")])
+        self.say(chat, "📦 پلن‌ها" + ("" if rows else "\nهنوز پلنی ساخته نشده."), kb(*buttons))
+
+    def plan_card(self, chat, pid):
+        plan = self.store.one("SELECT * FROM plans WHERE id = ?", (pid,))
+        if not plan:
+            return self.say(chat, "این پلن پیدا نشد.")
+        tpl = (self.store.one("SELECT name FROM templates WHERE id = ?", (plan["template_id"],))
+               if plan["template_id"] else None)
+        sold = self.store.one("SELECT count(*) c FROM transactions WHERE plan_id = ?"
+                              " AND status = 'approved'", (pid,))["c"]
+        self.say(chat, "%s\nقالب: %s\nوضعیت: %s\nفروخته‌شده: %d" % (
+            P.plan_summary(plan), tpl["name"] if tpl else "قالب کاربر عوض نمی‌شود",
+            "در فروش" if plan["active"] else "فروش متوقف", sold), kb(
+            [btn("✏️ ویرایش", "a:pe:%d" % pid), btn("🗂 قالب", "a:pt:%d" % pid)],
+            [btn("⏸ توقف فروش" if plan["active"] else "▶️ فروش دوباره", "a:pa:%d" % pid),
+             btn("🗑 حذف", "a:pd:%d" % pid)],
+            [btn("↩️ همهٔ پلن‌ها", "a:pl")]))
+
+    # payments
+    def admin_payments(self, chat):
+        card, holder = self.setting("card_number"), self.setting("card_holder")
+        merchant, panel = self.setting("zarinpal_merchant"), self.setting("relay_panel")
+        lines = ["💳 روش‌های پرداخت", "",
+                 "کارت به کارت: %s" % ((format_card(card) + (" — " + holder if holder else ""))
+                                       if card else "تنظیم نشده"),
+                 "زرین‌پال: %s" % (("مرچنت " + merchant[:8] + "…") if merchant else "تنظیم نشده")]
+        if merchant and not panel:
+            lines.append("\n⚠️ پرداخت آنلاین از روی رله انجام می‌شود و هنوز رله‌ای با دامنه "
+                         "و گواهی همگام نشده؛ تا آن وقت دکمهٔ پرداخت آنلاین به مشتری نشان "
+                         "داده نمی‌شود.")
+        elif panel:
+            lines.append("\nدامنهٔ رله برای ثبت در پنل زرین‌پال: %s" % panel)
+        self.say(chat, "\n".join(lines), kb(
+            [btn("💳 شمارهٔ کارت", "a:pc"), btn("🔐 مرچنت زرین‌پال", "a:pz")],
+            [btn("حذف کارت", "a:pcx"), btn("حذف مرچنت", "a:pzx")]))
+
+    # stats
+    def admin_stats(self, chat):
+        s = self.store
+        counts = {r["status"]: r["c"] for r in s.q(
+            "SELECT status, count(*) c FROM users GROUP BY status")}
+        tg = s.one("SELECT count(*) c FROM users WHERE telegram_id IS NOT NULL")["c"]
+        used = s.one("SELECT COALESCE(sum(used_bytes), 0) b FROM users")["b"]
+        ips = s.one("SELECT count(*) c FROM ips")["c"]
+        pending = s.one("SELECT count(*) c FROM transactions WHERE status = 'pending'"
+                        " AND receipt_blob IS NOT NULL")["c"]
+        sales = s.one("SELECT count(*) c, COALESCE(sum(amount), 0) a FROM transactions"
+                      " WHERE status = 'approved' AND decided_at >= ?", (ago(days=30),))
+        lines = ["📊 آمار", "",
+                 "کاربران: %d (در ربات: %d)" % (sum(counts.values()), tg),
+                 "فعال: %d · در انتظار: %d · تمام‌شده: %d · مسدود: %d" % (
+                     counts.get("active", 0), counts.get("pending", 0),
+                     counts.get("over_quota", 0) + counts.get("expired", 0),
+                     counts.get("suspended", 0)),
+                 "آی‌پی ثبت‌شده: %d" % ips,
+                 "مجموع مصرف: %s" % P.human(used),
+                 "رسید در انتظار: %d" % pending,
+                 "فروش ۳۰ روز اخیر: %d مورد، %s" % (sales["c"], P.toman(sales["a"])),
+                 "", "🖥 سرورها:"]
+        rows = s.q("SELECT m.* FROM metrics m JOIN (SELECT host, MAX(at) at FROM metrics"
+                   " GROUP BY host) l ON l.host = m.host AND l.at = m.at ORDER BY m.host")
+        now = datetime.now(timezone.utc)
+        for r in rows:
+            seen = P.parse_ts(r["at"])
+            stale = not seen or (now - seen).total_seconds() > 120
+
+            def pct(a, b):
+                return ("%d٪" % (100 * (a or 0) / b)) if b else "-"
+            lines.append("%s %s — CPU %s · RAM %s · دیسک %s%s" % (
+                "🔴" if stale else "🟢", r["host"],
+                ("%.0f٪" % r["cpu"]) if r["cpu"] is not None else "-",
+                pct(r["mem_used"], r["mem_total"]), pct(r["disk_used"], r["disk_total"]),
+                " · قطع" if stale else ""))
+        if not rows:
+            lines.append("هنوز آماری نرسیده.")
+        self.say(chat, "\n".join(lines))
+
+
+# ---------------------------------------------------------------------- main
+def open_store():
+    os.makedirs(os.path.dirname(P.DB), exist_ok=True)
+    # The panel may be migrating the same database this instant, straight
+    # after an upgrade; losing that race is a "duplicate column" that goes away
+    # on the next try.
+    for _ in range(10):
+        try:
+            return P.Store(P.DB)
+        except sqlite3.OperationalError as e:
+            P.log(P.WARN, "bot: database not ready (%s) - trying again" % e)
+            time.sleep(3)
+    return P.Store(P.DB)
+
+
+def relay_addresses():
+    try:
+        cfg = P.load_config()
+    except (OSError, SystemExit):
+        return ()
+    return tuple(x.strip() for x in cfg.get("RELAY_IP", "").split(",") if x.strip())
+
+
+def run():
+    store = open_store()
+    relays = relay_addresses()
+    token, bot, offset, retry_at = None, None, None, 0.0
+    while True:
+        want = store.setting("bot_token", "").strip()
+        if want != token or (want and bot is None and time.time() >= retry_at):
+            if bot:
+                bot.stop()
+                bot = None
+            if want != token:
+                offset = None
+            token = want
+            if not token:
+                P.log(P.INFO, "bot: no token - set one in the admin panel's settings, "
+                              "or with: smartdns-bot token")
+            else:
+                tg = Telegram(token)
+                try:
+                    me = tg.call("getMe")
+                    tg.call("deleteWebhook")
+                    store.set_setting("bot_username", me.get("username") or "")
+                    bot = Bot(store, tg, relays)
+                    bot.start()
+                    P.log(P.INFO, "bot: up as @%s" % me.get("username"))
+                except TelegramError as e:
+                    P.log(P.ERROR, "bot: telegram refused the token: %s" % e)
+                    retry_at = time.time() + 300
+                except Exception as e:
+                    P.log(P.WARN, "bot: telegram unreachable: %s" % e)
+                    retry_at = time.time() + 30
+        if not bot:
+            time.sleep(5)
+            continue
+        try:
+            updates = bot.tg.call("getUpdates", offset=offset, timeout=POLL_SECONDS,
+                                  allowed_updates=["message", "callback_query"])
+        except TelegramError as e:
+            P.log(P.WARN, "bot: getUpdates refused: %s" % e)
+            if e.code == 401:
+                bot.stop()
+                bot, retry_at = None, time.time() + 300
+            time.sleep(5)
+            continue
+        except Exception as e:
+            P.log(P.WARN, "bot: telegram unreachable: %s" % e)
+            time.sleep(10)
+            continue
+        for update in updates or []:
+            offset = update["update_id"] + 1
+            try:
+                bot.handle(update)
+            except Exception:
+                P.log_exception("bot: update %s failed" % update.get("update_id"))
+
+
+def cli(args):
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        print("run as root:  sudo smartdns-bot %s" % " ".join(args), file=sys.stderr)
+        return 1
+    store = open_store()
+    cmd = args[0]
+    if cmd == "status":
+        token = store.setting("bot_token", "")
+        name = store.setting("bot_username", "")
+        code, _, until = store.setting("bot_admin_code", "").partition("|")
+        print("token    %s" % (mask(token) if token else "not set"))
+        print("bot      %s" % (("@" + name) if name else "-"))
+        print("admins   %s" % (", ".join(str(a) for a in P.bot_admins(store)) or "none"))
+        print("code     %s" % (("/admin %s  (until %s UTC)" % (code, until[:16])) if code else "none"))
+        print("relay    %s" % (store.setting("relay_panel", "") or
+                               "no relay with a domain has synced - no mini app, no online payment"))
+        return 0
+    if cmd == "token":
+        token = args[1] if len(args) > 1 else getpass.getpass("bot token (from @BotFather): ")
+        token = token.strip()
+        if not TOKEN_RE.match(token):
+            print("that is not a bot token - it looks like 123456789:AA... ", file=sys.stderr)
+            return 2
+        store.set_setting("bot_token", token)
+        store.set_setting("bot_username", "")
+        code = P.new_admin_code(store)
+        print("token saved - the bot connects within a few seconds.")
+        print("to become its admin, send it this (works once, for 24 hours):\n\n    /admin %s\n"
+              % code)
+        return 0
+    if cmd == "code":
+        print("send the bot this (works once, for 24 hours):\n\n    /admin %s\n"
+              % P.new_admin_code(store))
+        return 0
+    if cmd == "off":
+        store.set_setting("bot_token", "")
+        store.set_setting("bot_username", "")
+        print("token forgotten - the bot goes quiet within a few seconds")
+        return 0
+    print(__doc__.split("\n\n")[-2], file=sys.stderr)
+    return 2
+
+
+def main(argv):
+    global P
+    P = load_panel()
+    if len(argv) > 1:
+        return cli(argv[1:])
+
+    def bye(*_):
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+    run()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

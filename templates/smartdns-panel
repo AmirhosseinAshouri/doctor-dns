@@ -10,12 +10,14 @@ position, and this way it needs no new inbound port.
 One database serves every relay. That is what makes a customer's allowance
 mean one thing across the whole service rather than one thing per machine.
 
-There was a Telegram bot in this process. It is gone: almost every account was
-opened on the web panel and had no Telegram behind it, so the bot's commands
-had all grown web equivalents and its messages were reaching a shrinking
-minority. What it did for customers - registering an address, seeing an
-account, being warned before the allowance runs out - the panel on each relay
-now does for everybody.
+There was a Telegram bot in this process, and it went: its messages reached a
+shrinking minority while the panel on each relay did the same work for
+everybody. It is back as smartdns-bot, a process of its own, so a Telegram
+outage or a bug in a chat handler cannot take the sync API down with it. That
+process loads this file for the rules defined here - what a plan does to an
+account, how a payment is settled, who is told what - so there is one copy of
+them. Messages are queued in the outbox table; nothing in this process talks
+to Telegram.
 
 Only the standard library is used, so the installer stays a single file with
 no pip step.
@@ -223,6 +225,37 @@ CREATE TABLE IF NOT EXISTS metrics (
     uptime     INTEGER
 );
 CREATE INDEX IF NOT EXISTS metrics_host_at ON metrics(host, at);
+
+-- What a customer can buy in the bot. A plan is a price and what it sets on the
+-- account once paid for: an allowance, a period starting that day, a speed and,
+-- optionally, a template. Deleting a plan that was ever sold only stops its
+-- sale, so a payment already made can still be settled against it.
+CREATE TABLE IF NOT EXISTS plans (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL,
+    quota_gb    REAL NOT NULL DEFAULT 0,
+    days        INTEGER NOT NULL DEFAULT 30,
+    speed_mbps  REAL NOT NULL DEFAULT 0,
+    price       INTEGER NOT NULL DEFAULT 0,
+    template_id INTEGER REFERENCES templates(id) ON DELETE SET NULL,
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL
+);
+
+-- Telegram messages waiting for smartdns-bot to deliver. Whichever process
+-- decides something a customer should hear about - a quota pass here, a
+-- receipt approved in the admin panel - leaves a row, and the bot sends it. A
+-- table rather than a call, because those processes never talk to Telegram,
+-- and a message queued while the bot is down is still sent once it is back.
+CREATE TABLE IF NOT EXISTS outbox (
+    id         INTEGER PRIMARY KEY,
+    chat_id    INTEGER NOT NULL,
+    text       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    sent_at    TEXT,
+    attempts   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS outbox_unsent ON outbox(sent_at, id);
 """
 
 METRIC_FIELDS = ("cpu", "load", "mem_used", "mem_total", "swap_used",
@@ -255,6 +288,18 @@ MIGRATIONS = [
     ("transactions", "receipt_blob", "BLOB"),
     ("transactions", "receipt_type", "TEXT"),
     ("transactions", "note", "TEXT"),
+    # What a payment was for, and how an online one is found again: the token
+    # in the link the bot hands out, and Zarinpal's own references for it.
+    ("transactions", "plan_id", "INTEGER REFERENCES plans(id)"),
+    ("transactions", "pay_token", "TEXT"),
+    ("transactions", "authority", "TEXT"),
+    ("transactions", "ref_id", "TEXT"),
+    # Whether a decision has been carried out - the plan applied, the customer
+    # told - and whether the bot's admins have been shown the receipt. Both
+    # default to done, so rows from before the bot are neither applied again
+    # nor forwarded; code that creates work sets them to 0.
+    ("transactions", "settled", "INTEGER NOT NULL DEFAULT 1"),
+    ("transactions", "admin_notified", "INTEGER NOT NULL DEFAULT 1"),
 ]
 
 # Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -268,6 +313,7 @@ INDEXES = [
     # not collide in a unique index, which is what accounts that never had one
     # need.
     "CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS transactions_pay_token ON transactions(pay_token)",
 ]
 
 # Where the installer puts the service catalogue - which brands exist, which
@@ -717,6 +763,45 @@ class Store:
     def user_ips(self, user_id):
         return self.q("SELECT * FROM ips WHERE user_id = ? ORDER BY added_at", (user_id,))
 
+    def claim_ip(self, user_id, ip):
+        """Register an address to an account: from the relay's page, from the
+        bot's mini app, or typed into the bot.
+
+        One active address per account, with as many changes as they like.
+        Replacing rather than adding is what makes that true.
+        """
+        owner = self.one("SELECT user_id FROM ips WHERE ip = ?", (ip,))
+        if owner and owner["user_id"] != user_id:
+            return {"ok": False, "message": "این آی‌پی به حساب دیگری ثبت شده است"}
+        user = self.one("SELECT * FROM users WHERE id = ?", (user_id,))
+        if not user:
+            return {"ok": False, "message": "حساب پیدا نشد"}
+        existing = self.user_ips(user_id)
+        if existing and len(existing) >= user["max_ips"]:
+            for old in existing[: len(existing) - user["max_ips"] + 1]:
+                self.run("DELETE FROM ips WHERE id = ?", (old["id"],))
+        self.run(
+            "INSERT OR REPLACE INTO ips (user_id, ip, added_at) VALUES (?, ?, ?)",
+            (user_id, ip, now()))
+        return {"ok": True, "message": "آی‌پی %s ثبت شد" % ip}
+
+    def note_relay(self, panel, dns):
+        """Remember where a relay's customer pages are, and its DNS address.
+
+        The bot runs here but links customers to the relay - the mini app that
+        registers an address and the payment page both live there - and tells
+        them which DNS address to type in. The relay reports both on every
+        sync. With several relays the last to sync wins, which is fine while
+        they are interchangeable. Written only when it changes, because this
+        runs every thirty seconds per relay.
+        """
+        if (isinstance(panel, str)
+                and re.fullmatch(r"https://[A-Za-z0-9.-]{1,253}(:\d{1,5})?", panel)
+                and self.setting("relay_panel") != panel):
+            self.set_setting("relay_panel", panel)
+        if isinstance(dns, str) and valid_ip(dns) and self.setting("relay_dns") != dns:
+            self.set_setting("relay_dns", dns)
+
     def allowed(self):
         return self.q(
             "SELECT i.ip AS ip, u.id AS uid FROM ips i JOIN users u ON u.id = i.user_id"
@@ -1119,6 +1204,248 @@ class Health:
         }
 
 
+# ------------------------------------------------------- plans and payments
+# What an account is told, queued for smartdns-bot. Only an account with a
+# Telegram behind it hears anything; the rest see the same news on the relay's
+# page, which reads the same columns.
+MSG_EXPIRED = ("⏳ دورهٔ سرویس شما تمام شد و سرویس قطع است.\n"
+               "برای تمدید، از «🛒 خرید / تمدید» یک پلن بخرید.")
+MSG_OVER_QUOTA = ("⛔️ حجم سرویس شما تمام شد و سرویس قطع است.\n"
+                  "برای ادامه، از «🛒 خرید / تمدید» یک پلن بخرید.")
+MSG_ACTIVATED = ("✅ حساب شما فعال شد.\n"
+                 "اگر هنوز آی‌پی اینترنتتان را ثبت نکرده‌اید، از «🌐 ثبت آی‌پی» ثبتش کنید.")
+
+# How long a payment link stays good. Long enough to go and find a card and
+# come back; short enough that an old link cannot buy at an old price.
+PAY_LINK_HOURS = 24
+
+# How old a mini app's signed launch data may be. It is signed when the app
+# opens and used seconds later; an hour forgives a phone left on the page.
+INIT_DATA_MAX_AGE = 3600
+
+
+def human_fa(n):
+    n = float(n or 0)
+    for unit in ("بایت", "کیلوبایت", "مگابایت", "گیگابایت", "ترابایت"):
+        if n < 1024 or unit == "ترابایت":
+            return ("%d %s" if unit == "بایت" else "%.2f %s") % (n, unit)
+        n /= 1024
+
+
+def toman(n):
+    return "%s تومان" % format(int(n or 0), ",")
+
+
+def user_label(user):
+    name = user["first_name"] or user["username"] or user["phone"] or ""
+    return ("%s (#%d)" % (name, user["id"])) if name else "#%d" % user["id"]
+
+
+def plan_summary(plan):
+    gb = float(plan["quota_gb"] or 0)
+    parts = [plan["name"],
+             ("%g گیگ" % gb) if gb else "حجم نامحدود",
+             ("%d روز" % plan["days"]) if plan["days"] else "بدون محدودیت زمان"]
+    if plan["speed_mbps"]:
+        parts.append("%g مگابیت" % float(plan["speed_mbps"]))
+    parts.append(toman(plan["price"]))
+    return " · ".join(parts)
+
+
+def queue_message(store, chat_id, text):
+    if chat_id:
+        store.run("INSERT INTO outbox (chat_id, text, created_at) VALUES (?, ?, ?)",
+                  (int(chat_id), text, now()))
+
+
+def tell_user(store, user, text):
+    queue_message(store, user["telegram_id"], text)
+
+
+def bot_admins(store):
+    """The Telegram chats allowed into the bot's admin menu."""
+    return [int(x) for x in store.setting("bot_admins", "").split(",")
+            if re.fullmatch(r"\s*-?\d{1,20}\s*", x)]
+
+
+def tell_admins(store, text):
+    for chat in bot_admins(store):
+        queue_message(store, chat, text)
+
+
+def new_admin_code(store, hours=24):
+    """A one-time code that makes whoever sends it to the bot its admin.
+
+    Shown in the admin panel, or printed by `smartdns-bot code`, only to
+    somebody who has already proved they run this machine - which is what makes
+    eight hex digits for a day enough.
+    """
+    code = secrets.token_hex(4)
+    until = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat(
+        timespec="seconds")
+    store.set_setting("bot_admin_code", "%s|%s" % (code, until))
+    return code
+
+
+def telegram_init_data(token, raw, max_age=None):
+    """The Telegram user a mini app was opened by, or None.
+
+    Telegram signs what it hands a mini app with a key derived from the bot's
+    token: HMAC-SHA256 of the token keyed with "WebAppData", then HMAC-SHA256
+    of every other field, sorted and joined as key=value lines. A match proves
+    the data came from Telegram for this bot; auth_date keeps an old copy from
+    being replayed.
+    """
+    if not token or not raw:
+        return None
+    try:
+        pairs = urllib.parse.parse_qsl(raw, keep_blank_values=True,
+                                       strict_parsing=True)
+    except ValueError:
+        return None
+    fields = dict(pairs)
+    given = fields.pop("hash", "")
+    # A repeated field is not something Telegram sends, and would let the
+    # checked value and the used value differ.
+    if not given or len(pairs) != len(fields) + 1:
+        return None
+    check = "\n".join("%s=%s" % (k, fields[k]) for k in sorted(fields))
+    secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    want = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(want, given.lower()):
+        return None
+    try:
+        age = time.time() - int(fields.get("auth_date", ""))
+        user = json.loads(fields.get("user", ""))
+        int(user["id"])
+    except (ValueError, KeyError, TypeError):
+        return None
+    if age > (INIT_DATA_MAX_AGE if max_age is None else max_age) or age < -300:
+        return None
+    return user
+
+
+def apply_plan(store, user_id, plan):
+    """Give an account what a plan says, from now.
+
+    Buying is renewing: the allowance is replaced rather than added to, usage
+    starts again from zero and the period is counted from today - the same as
+    an operator opening the row and typing the plan in. A suspended account
+    stays suspended: paying does not overrule a decision to block somebody. A
+    plan with no template leaves the account's template alone.
+    """
+    days = int(plan["days"] or 0)
+    ends = ((datetime.now(timezone.utc) + timedelta(days=days)).isoformat(
+        timespec="seconds") if days > 0 else None)
+    store.run(
+        "UPDATE users SET quota_bytes = ?, used_bytes = 0, warned = 0,"
+        " speed_kbps = ?, quota_mode = 'oneoff', quota_reset_at = NULL,"
+        " expires_at = ?, template_id = COALESCE(?, template_id),"
+        " status = CASE WHEN status = 'suspended' THEN status ELSE 'active' END"
+        " WHERE id = ?",
+        (int(float(plan["quota_gb"] or 0) * GB),
+         int(float(plan["speed_mbps"] or 0) * 1000), ends,
+         plan["template_id"], user_id))
+
+
+def settle_transactions(store):
+    """Carry out payment decisions nobody has acted on yet.
+
+    A receipt approved in the admin panel or the bot, or a payment the relay
+    has had Zarinpal confirm, is marked settled = 0; this applies its plan and
+    tells the customer. Both this process, after every sync, and smartdns-bot
+    run it, so a decision takes effect within seconds when the bot is up and
+    within a sync when it is not.
+    """
+    rows = store.q(
+        "SELECT t.*, p.name AS plan_name, p.quota_gb, p.days, p.speed_mbps,"
+        " p.template_id FROM transactions t LEFT JOIN plans p ON p.id = t.plan_id"
+        " WHERE t.settled = 0 AND t.status IN ('approved', 'rejected')"
+        " ORDER BY t.id")
+    for t in rows:
+        # Claimed and carried out as two steps, claim first: whichever process
+        # claims a row does it, once. A crash in between leaves it unapplied
+        # and logged, which an operator can see and fix; applying it twice
+        # would silently reset somebody's usage a second time.
+        if store.run("UPDATE transactions SET settled = 1 WHERE id = ? AND settled = 0",
+                     (t["id"],)).rowcount != 1:
+            continue
+        user = store.one("SELECT * FROM users WHERE id = ?", (t["user_id"],))
+        if not user:
+            continue
+        if t["status"] == "rejected":
+            tell_user(store, user, "❌ رسید پرداخت شما رد شد.\nاگر فکر می‌کنید اشتباهی "
+                                   "شده، رسید درست را دوباره بفرستید یا با پشتیبانی "
+                                   "تماس بگیرید.")
+        elif t["plan_name"] is not None:
+            apply_plan(store, user["id"], t)
+            print("plan applied: user %d, %s, transaction %d"
+                  % (user["id"], t["plan_name"], t["id"]), flush=True)
+            tell_user(store, user, "✅ پرداخت شما تأیید شد و پلن «%s» فعال شد.\n"
+                                   "اگر آی‌پی‌تان را ثبت نکرده‌اید، از «🌐 ثبت آی‌پی» "
+                                   "ثبتش کنید." % t["plan_name"])
+        else:
+            tell_user(store, user, "✅ رسید پرداخت شما تأیید شد. حسابتان به‌زودی "
+                                   "شارژ می‌شود.")
+
+
+# What an operator does to one account from the bot. The admin panel's forms do
+# the same; that panel keeps its own copy rather than importing this file, so a
+# change to what these mean has to be made in both.
+def activate_if_pending(store, user_id):
+    if store.run("UPDATE users SET status = 'active' WHERE id = ? AND status = 'pending'",
+                 (user_id,)).rowcount:
+        tell_user(store, store.one("SELECT * FROM users WHERE id = ?", (user_id,)),
+                  MSG_ACTIVATED)
+        return True
+    return False
+
+
+def set_user_quota(store, user_id, gb):
+    store.run("UPDATE users SET quota_bytes = ?, warned = 0,"
+              " status = CASE WHEN status = 'over_quota' THEN 'active' ELSE status END"
+              " WHERE id = ?", (int(float(gb) * GB), user_id))
+    return activate_if_pending(store, user_id)
+
+
+def set_user_days(store, user_id, days):
+    days = float(days)
+    if days == 0:
+        store.run("UPDATE users SET expires_at = NULL, quota_reset_at = NULL,"
+                  " quota_mode = 'oneoff', status = CASE WHEN status = 'expired'"
+                  " THEN 'active' ELSE status END WHERE id = ?", (user_id,))
+    else:
+        stamp = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(
+            timespec="seconds")
+        row = store.one("SELECT quota_mode FROM users WHERE id = ?", (user_id,))
+        if row and row["quota_mode"] == "monthly":
+            store.run("UPDATE users SET quota_reset_at = ? WHERE id = ?",
+                      (stamp, user_id))
+        else:
+            store.run("UPDATE users SET expires_at = ?, status = CASE WHEN"
+                      " status = 'expired' THEN 'active' ELSE status END"
+                      " WHERE id = ?", (stamp, user_id))
+    return activate_if_pending(store, user_id)
+
+
+def set_user_speed(store, user_id, mbps):
+    store.run("UPDATE users SET speed_kbps = ? WHERE id = ?",
+              (int(float(mbps) * 1000), user_id))
+
+
+def set_user_status(store, user_id, to):
+    if to not in ("active", "suspended"):
+        raise ValueError("no such status: %r" % to)
+    store.run("UPDATE users SET status = ?, warned = CASE WHEN ? = 'active'"
+              " THEN 0 ELSE warned END WHERE id = ?", (to, to, user_id))
+
+
+def reset_user_usage(store, user_id):
+    store.run("UPDATE users SET used_bytes = 0, warned = 0,"
+              " status = CASE WHEN status = 'over_quota' THEN 'active'"
+              " ELSE status END WHERE id = ?", (user_id,))
+
+
 # ------------------------------------------------------------------ quota
 def enforce_quotas(store):
     """Reset, warn and cut off. Called after every sync.
@@ -1128,10 +1455,10 @@ def enforce_quotas(store):
     smartdns-acl removes it from the kernel. Nothing here touches a firewall
     directly - one place decides who may connect, and it is the database.
 
-    Nothing is sent anywhere either. The warning thresholds are recorded in
-    users.warned and the customer is told on their own panel page, which
-    reaches everybody - most accounts have no Telegram behind them and never
-    did, so a message was only ever going to some of them.
+    The warning thresholds are recorded in users.warned, which the customer's
+    own panel page reads - that reaches everybody. An account with a Telegram
+    behind it is also sent a message, queued here and delivered by
+    smartdns-bot; nothing in this process talks to Telegram.
     """
     stamp = datetime.now(timezone.utc)
     for u in store.q("SELECT * FROM users"):
@@ -1148,6 +1475,7 @@ def enforce_quotas(store):
                           (u["id"],))
                 print("expired: user %d after %s" % (u["id"], human(used)),
                       flush=True)
+                tell_user(store, u, MSG_EXPIRED)
             continue
 
         # Monthly plans roll over on their own date rather than on the 1st, so
@@ -1171,15 +1499,28 @@ def enforce_quotas(store):
             store.run("UPDATE users SET status = 'over_quota' WHERE id = ?", (u["id"],))
             print("over quota: user %d at %s of %s"
                   % (u["id"], human(used), human(quota)), flush=True)
+            tell_user(store, u, MSG_OVER_QUOTA)
             continue
 
         # Record each threshold as it is crossed, once. The bit is what makes
         # it once - a sync runs every thirty seconds - and it is what the
         # customer's own page reads to decide whether to warn them.
-        for fraction, bit in THRESHOLDS:
-            if used >= quota * fraction and not (u["warned"] & bit):
-                store.run("UPDATE users SET warned = warned | ? WHERE id = ?",
-                          (bit, u["id"]))
+        crossed = [(fraction, bit) for fraction, bit in THRESHOLDS
+                   if used >= quota * fraction and not (u["warned"] & bit)]
+        for fraction, bit in crossed:
+            store.run("UPDATE users SET warned = warned | ? WHERE id = ?",
+                      (bit, u["id"]))
+        # One message for the highest line crossed, not one per line: usage
+        # that jumps past 80% and 95% in one sync is one piece of news.
+        if crossed:
+            tell_user(store, u, "⚠️ %d٪ حجم سرویس شما مصرف شده — %s مانده.\n"
+                                "برای تمدید از «🛒 خرید / تمدید» استفاده کنید."
+                      % (int(crossed[-1][0] * 100), human_fa(max(0, quota - used))))
+
+    # Decisions made since the last pass - a receipt approved in the admin
+    # panel, a payment the relay verified - take effect here if smartdns-bot
+    # has not already carried them out.
+    settle_transactions(store)
 
 
 # ------------------------------------------------------------------ logging
@@ -1357,6 +1698,7 @@ class API(http.server.BaseHTTPRequestHandler):
             # The relay names itself by the address it connected from, so a
             # second relay appears on its own without any configuration.
             self.store.record_metrics(self.client_address[0], body.get("host") or {})
+            self.store.note_relay(body.get("panel"), body.get("dns"))
             # Quotas are evaluated here, on fresh numbers, so a user who runs
             # out is off the list this relay is about to be handed.
             try:
@@ -1395,6 +1737,16 @@ class API(http.server.BaseHTTPRequestHandler):
             return self.reply(200, self.do_user_receipt(body))
         if self.path == "/user-password":
             return self.reply(200, self.do_user_password(body))
+
+        # ---- the bot's mini app and online payment, served by the relay ----
+        if self.path == "/tg-claim":
+            return self.reply(200, self.do_tg_claim(body))
+        if self.path == "/pay-order":
+            return self.reply(200, self.do_pay_order(body))
+        if self.path == "/pay-started":
+            return self.reply(200, self.do_pay_started(body))
+        if self.path == "/pay-verified":
+            return self.reply(200, self.do_pay_verified(body))
 
         return self.reply(404, {"error": "no such endpoint"})
 
@@ -1558,8 +1910,8 @@ class API(http.server.BaseHTTPRequestHandler):
         self.store.run(
             "INSERT INTO transactions"
             " (user_id, amount, kind, receipt_blob, receipt_type, note,"
-            "  status, created_at)"
-            " VALUES (?, ?, 'card', ?, ?, ?, 'pending', ?)",
+            "  status, created_at, admin_notified)"
+            " VALUES (?, ?, 'card', ?, ?, ?, 'pending', ?, 0)",
             (user["id"], amount, blob, kind,
              (body.get("note") or "").strip()[:200], now()))
         print("receipt from user %d: %s, %s"
@@ -1579,20 +1931,7 @@ class API(http.server.BaseHTTPRequestHandler):
         return self.do_claim_register(user["id"], ip)
 
     def do_claim_register(self, user_id, ip):
-        owner = self.store.one("SELECT user_id FROM ips WHERE ip = ?", (ip,))
-        if owner and owner["user_id"] != user_id:
-            return {"ok": False, "message": "این آی‌پی به حساب دیگری ثبت شده است"}
-        user = self.store.one("SELECT * FROM users WHERE id = ?", (user_id,))
-        existing = self.store.user_ips(user_id)
-        # One active address per account, with as many changes as they like.
-        # Replacing rather than adding is what makes that true.
-        if existing and len(existing) >= user["max_ips"]:
-            for old in existing[: len(existing) - user["max_ips"] + 1]:
-                self.store.run("DELETE FROM ips WHERE id = ?", (old["id"],))
-        self.store.run(
-            "INSERT OR REPLACE INTO ips (user_id, ip, added_at) VALUES (?, ?, ?)",
-            (user_id, ip, now()))
-        return {"ok": True, "message": "آی‌پی %s ثبت شد" % ip}
+        return self.store.claim_ip(user_id, ip)
 
     def do_user_info(self, body):
         user = self._session_user(body.get("session"))
@@ -1621,6 +1960,111 @@ class API(http.server.BaseHTTPRequestHandler):
             "warned": user["warned"] or 0,
             "seen_ip": body.get("ip", ""),
         }
+
+    # ---- the bot's mini app and online payment ---------------------------
+    def do_tg_claim(self, body):
+        """Register the address a mini app was opened from.
+
+        The relay supplies the address - it is the only machine that sees the
+        customer's real one - and the launch data Telegram signed, which only
+        this side can check, because only this side has the bot's token.
+        """
+        tg = telegram_init_data(self.store.setting("bot_token"),
+                                body.get("init_data") or "")
+        if not tg:
+            return {"ok": False, "message": "این صفحه را از داخل ربات باز کنید"}
+        user = self.store.user_by_telegram(int(tg["id"]))
+        if not user:
+            return {"ok": False, "message": "اول ربات را استارت کنید"}
+        self._who = "user #%d" % user["id"]
+        ip = body.get("ip", "")
+        if not valid_ip(ip):
+            return {"ok": False, "message": "آی‌پی نامعتبر"}
+        res = self.store.claim_ip(user["id"], ip)
+        if res.get("ok"):
+            tell_user(self.store, user, "🌐 آی‌پی %s برای حساب شما ثبت شد." % ip)
+        return res
+
+    def _order(self, body):
+        token = body.get("token") or ""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", token):
+            return None
+        return self.store.one(
+            "SELECT t.*, p.name AS plan_name FROM transactions t"
+            " LEFT JOIN plans p ON p.id = t.plan_id"
+            " WHERE t.pay_token = ? AND t.kind = 'zarinpal'", (token,))
+
+    def do_pay_order(self, body):
+        """What the relay needs to send a customer to Zarinpal, or why not."""
+        t = self._order(body)
+        if not t:
+            return {"ok": False, "message": "این لینک پرداخت معتبر نیست"}
+        self._who = "user #%d" % t["user_id"]
+        if t["status"] == "approved":
+            return {"ok": False, "paid": True,
+                    "message": "این سفارش پرداخت شده و پلنش فعال است"}
+        born = parse_ts(t["created_at"])
+        expired = (not born or datetime.now(timezone.utc) - born
+                   > timedelta(hours=PAY_LINK_HOURS))
+        # Somebody already at the gateway when the link runs out is let back
+        # in: they may well have paid, and that has to be recorded.
+        if t["status"] != "started" or (
+                expired and not (body.get("returning") and t["authority"])):
+            return {"ok": False, "message": "این لینک پرداخت منقضی شده؛ از ربات "
+                                           "دوباره اقدام کنید"}
+        merchant = self.store.setting("zarinpal_merchant")
+        if not merchant:
+            return {"ok": False, "message": "پرداخت آنلاین الان فعال نیست"}
+        return {"ok": True, "amount": int(t["amount"]), "merchant": merchant,
+                "authority": t["authority"] or "",
+                "description": "doctor dns - %s" % (t["plan_name"] or "plan")}
+
+    def do_pay_started(self, body):
+        t = self._order(body)
+        authority = body.get("authority") or ""
+        if (not t or t["status"] != "started"
+                or not re.fullmatch(r"[A-Za-z0-9]{8,64}", authority)):
+            return {"ok": False, "message": "این سفارش شروع نشد"}
+        self.store.run("UPDATE transactions SET authority = ?"
+                       " WHERE id = ? AND status = 'started'", (authority, t["id"]))
+        return {"ok": True}
+
+    def do_pay_verified(self, body):
+        """The relay has had Zarinpal confirm a payment: settle it.
+
+        The authority must be the one recorded for this order when the customer
+        was sent to pay. Zarinpal verifies any authority it issued to this
+        merchant, so without this one real payment could be presented again
+        against a second order for the same amount.
+        """
+        t = self._order(body)
+        if not t:
+            return {"ok": False, "message": "این لینک پرداخت معتبر نیست"}
+        self._who = "user #%d" % t["user_id"]
+        if t["status"] == "approved":
+            return {"ok": True, "message": "پرداخت شما ثبت شده و پلن فعال است"}
+        given = body.get("authority") or ""
+        if (t["status"] != "started" or not t["authority"]
+                or not hmac.compare_digest(t["authority"], given)):
+            return {"ok": False, "message": "این پرداخت با سفارش جور نیست"}
+        ref = str(body.get("ref_id") or "")[:40]
+        card = str(body.get("card_pan") or "")[:32]
+        cur = self.store.run(
+            "UPDATE transactions SET status = 'approved', decided_at = ?,"
+            " ref_id = ?, note = ?, settled = 0"
+            " WHERE id = ? AND status = 'started'",
+            (now(), ref, ("zarinpal %s" % card).strip(), t["id"]))
+        if cur.rowcount == 1:
+            settle_transactions(self.store)
+            print("online payment: user %d, %d toman, ref %s"
+                  % (t["user_id"], t["amount"], ref), flush=True)
+            user = self.store.one("SELECT * FROM users WHERE id = ?", (t["user_id"],))
+            if user:
+                tell_admins(self.store,
+                            "💰 پرداخت آنلاین\nکاربر: %s\nپلن: %s\nمبلغ: %s\n"
+                            "کد پیگیری: %s" % (user_label(user), t["plan_name"] or "-",
+                                               toman(t["amount"]), ref or "-"))
+        return {"ok": True, "message": "پرداخت انجام شد و پلن شما فعال شد"}
 
 
 def serve_api(cfg, store):
