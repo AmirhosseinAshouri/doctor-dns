@@ -509,7 +509,7 @@ esac
 # install with twenty configs missing.
 [ "$(tail -n 1 "$SELF")" = "#__DOCTOR_DNS_COMPLETE__" ] || die "this file is incomplete - the
     download stopped early. Fetch it again:
-        curl -fsSLO https://raw.githubusercontent.com/mehdi047/doctor-dns/main/doctor-dns.sh"
+        curl -fsSLO https://raw.githubusercontent.com/AmirhosseinAshouri/doctor-dns/main/doctor-dns.sh"
 command -v apt-get >/dev/null 2>&1 || die "this installer expects Debian or Ubuntu"
 
 # ---------------------------------------------------------------- uninstall
@@ -712,7 +712,7 @@ if [ -n "$INSTALLED_VERSION" ] && [ "$INSTALLED_VERSION" != "$VERSION" ]; then
         warn "this file is OLDER than what is installed."
         warn "installing it will put old configs over new ones, and this"
         warn "script has no way to undo what a later version did."
-        warn "the newest is at github.com/mehdi047/doctor-dns/releases"
+        warn "the newest is at github.com/AmirhosseinAshouri/doctor-dns/releases"
         answer=n
     else
         warn "this will upgrade this machine from $INSTALLED_VERSION to $VERSION."
@@ -12065,7 +12065,7 @@ exit 0
 ## somewhere else; nothing else sets them.
 #ETC="${SMARTDNS_ETC:-/etc/smart-dns}"
 #VERSION_FILE="${SMARTDNS_VERSION_FILE:-/var/lib/smart-dns/version}"
-#REPO="https://github.com/mehdi047/doctor-dns"
+#REPO="https://github.com/AmirhosseinAshouri/doctor-dns"
 #
 #B=$'\e[1m'; D=$'\e[2m'; G=$'\e[32m'; Y=$'\e[33m'; N=$'\e[0m'
 #[ -t 1 ] || { B=; D=; G=; Y=; N=; }
@@ -12171,7 +12171,7 @@ exit 0
 #    local f latest
 #    f="$(mktemp)"
 #    printf '\n  fetching the latest installer...\n'
-#    if ! curl -fsSL -m 120 -o "$f" "https://raw.githubusercontent.com/mehdi047/doctor-dns/main/doctor-dns.sh"; then
+#    if ! curl -fsSL -m 120 -o "$f" "https://raw.githubusercontent.com/AmirhosseinAshouri/doctor-dns/main/doctor-dns.sh"; then
 #        echo "  the download failed"; rm -f "$f"; pause; return 0
 #    fi
 #    latest="$(bash "$f" --version 2>/dev/null || echo '?')"
