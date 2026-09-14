@@ -12,7 +12,7 @@ set -uo pipefail
 # somewhere else; nothing else sets them.
 ETC="${SMARTDNS_ETC:-/etc/smart-dns}"
 VERSION_FILE="${SMARTDNS_VERSION_FILE:-/var/lib/smart-dns/version}"
-REPO="https://github.com/mehdi047/doctor-dns"
+REPO="https://github.com/AmirhosseinAshouri/doctor-dns"
 
 B=$'\e[1m'; D=$'\e[2m'; G=$'\e[32m'; Y=$'\e[33m'; N=$'\e[0m'
 [ -t 1 ] || { B=; D=; G=; Y=; N=; }
@@ -118,7 +118,7 @@ update() {
     local f latest
     f="$(mktemp)"
     printf '\n  fetching the latest installer...\n'
-    if ! curl -fsSL -m 120 -o "$f" "https://raw.githubusercontent.com/mehdi047/doctor-dns/main/doctor-dns.sh"; then
+    if ! curl -fsSL -m 120 -o "$f" "https://raw.githubusercontent.com/AmirhosseinAshouri/doctor-dns/main/doctor-dns.sh"; then
         echo "  the download failed"; rm -f "$f"; pause; return 0
     fi
     latest="$(bash "$f" --version 2>/dev/null || echo '?')"
