@@ -16,7 +16,7 @@ in one install script with no dependencies beyond what Debian ships.
 
 They are worth more than anything else right now. If something breaks, or a
 service you expected to work does not,
-[open an issue](https://github.com/mehdi047/doctor-dns/issues) — say which
+[open an issue](https://github.com/AmirhosseinAshouri/doctor-dns/issues) — say which
 side it was, what you ran, and what happened. A report of one console failing
 one download is a genuinely useful thing; most of what is in here was learnt
 exactly that way.
@@ -94,7 +94,7 @@ One script, run once on each machine. It asks which side it is on and the
 address of the other.
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/mehdi047/doctor-dns/main/doctor-dns.sh && sudo bash doctor-dns.sh
+curl -fsSLO https://raw.githubusercontent.com/AmirhosseinAshouri/doctor-dns/main/doctor-dns.sh && sudo bash doctor-dns.sh
 ```
 
 It downloads rather than pipes on purpose. Every config this installs is
@@ -377,7 +377,7 @@ sudo smartdns del example.com
 What this cannot fix: names a service looks up itself without asking DNS -
 some mobile games do, and nothing shows in `smartdns-watch` for them - traffic
 that is neither HTTPS nor plain HTTP, and names that are `filtered in Iran`.
-When a set of names works, [open an issue](https://github.com/mehdi047/doctor-dns/issues)
+When a set of names works, [open an issue](https://github.com/AmirhosseinAshouri/doctor-dns/issues)
 with them, so they can go in the default list.
 
 **`smartdns-acl`** — who may use the relay, and what they have used. The panel
