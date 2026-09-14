@@ -1500,6 +1500,25 @@ EOF
         warn "port 8443 could not be closed to strangers - the panel still refuses them itself"
     fi
 
+    # ---- telegram bot ----------------------------------------------------
+    # On every exit, and idle until it has a token - from the admin panel's
+    # settings, or `smartdns-bot token` - so turning it on later needs no
+    # re-run. It listens on nothing: it only ever dials out to Telegram.
+    step "Telegram bot"
+    payload BOT > /usr/local/bin/smartdns-bot
+    chmod +x /usr/local/bin/smartdns-bot
+    note_file /usr/local/bin/smartdns-bot
+    install_payload BOT_SERVICE /etc/systemd/system/smartdns-bot.service || true
+    systemctl daemon-reload
+    enable_service smartdns-bot.service
+    systemctl restart smartdns-bot.service
+    sleep 1
+    if systemctl is-active --quiet smartdns-bot.service; then
+        info "bot service running - give it a token in the admin panel's settings, or: smartdns-bot token"
+    else
+        warn "the bot did not start - journalctl -u smartdns-bot"
+    fi
+
     # ---- admin web panel -------------------------------------------------
     if [ -n "${PANEL_DOMAIN:-}" ]; then
         step "Admin web panel"

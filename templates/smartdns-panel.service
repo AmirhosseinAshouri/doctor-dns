@@ -12,8 +12,9 @@ ExecStartPre=-+/usr/local/bin/smartdns-api-guard
 ExecStart=/usr/local/bin/smartdns-panel
 Restart=always
 RestartSec=10
-# The bot token lives in panel.env, not in the unit and not in the script,
-# because this repository is going to be public.
+# Secrets live in panel.env, not in the unit and not in the script, because
+# this repository is public. The Telegram bot's token is the exception: it is
+# in the database, set from the admin panel, and read by smartdns-bot.
 EnvironmentFile=-/etc/smart-dns/panel.env
 NoNewPrivileges=yes
 ProtectSystem=strict

@@ -1,0 +1,21 @@
+[Unit]
+Description=Smart DNS Telegram bot
+After=network-online.target smartdns-panel.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Idle until a token is set in the admin panel's settings, or with
+# `smartdns-bot token`; it reads the token from the database and needs no
+# restart to pick one up. It listens on nothing - it only dials out to Telegram.
+ExecStart=/usr/local/bin/smartdns-bot
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/smart-dns
+
+[Install]
+WantedBy=multi-user.target

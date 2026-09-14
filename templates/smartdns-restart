@@ -30,7 +30,7 @@ if [ -f "$ETC/sync.env" ]; then
     units="smartdns-sync$resolvers dnsmasq coturn smartdns-tunnel nginx"
 elif [ -f "$ETC/panel.env" ]; then
     role=exit
-    units="smartdns-panel smartdns-admin smartdns-tunnel nginx"
+    units="smartdns-panel smartdns-admin smartdns-bot smartdns-tunnel nginx"
 else
     echo "doctor dns is not installed on this machine" >&2
     exit 1
@@ -67,6 +67,7 @@ if [ "$role" = relay ]; then
 else
     restart smartdns-panel
     installed smartdns-admin && restart smartdns-admin
+    installed smartdns-bot && restart smartdns-bot
 fi
 # The tunnel, when there is one, before nginx: nginx falls back to the direct
 # path while it is down, so this order costs nobody a connection.

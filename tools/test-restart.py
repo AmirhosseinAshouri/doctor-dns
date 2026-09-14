@@ -131,9 +131,9 @@ check("a service that does not come back is named, and the command fails",
 
 print("on an exit")
 r, done, _ = machine("exit")
-check("it restarts both panels, the tunnel and nginx",
-      r.returncode == 0 and sorted(done) == ["nginx", "smartdns-admin", "smartdns-panel",
-                                             "smartdns-tunnel"],
+check("it restarts both panels, the bot, the tunnel and nginx",
+      r.returncode == 0 and sorted(done) == ["nginx", "smartdns-admin", "smartdns-bot",
+                                             "smartdns-panel", "smartdns-tunnel"],
       str(done) + r.stdout + r.stderr)
 r, done, _ = machine("exit", FAKE_MISSING="smartdns-tunnel")
 check("a machine with no tunnel does not restart one",

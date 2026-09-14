@@ -42,7 +42,9 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
+import urllib.request
 
 CONFIG = "/etc/smart-dns/sync.env"
 ACL = "/usr/local/bin/smartdns-acl"
@@ -57,6 +59,10 @@ PANEL_TLS_PORT = 8443
 # A photograph of a bank slip, from a phone camera. The exit refuses anything
 # past four megabytes, so there is no point carrying more than that up to it.
 MAX_RECEIPT = 4 * 1024 * 1024
+
+# Zarinpal, called from here rather than from the exit: an Iranian gateway
+# answers an Iranian server, and the customer's browser has to come back to one.
+ZARINPAL = "https://payment.zarinpal.com/pg"
 
 
 def load_config():
@@ -779,7 +785,14 @@ def sync_once():
         host = HEALTH.sample()
     except Exception as e:
         host = {"error": str(e)}
-    answer = post("/sync", {"counters": counters, "host": host})
+    report = {"counters": counters, "host": host,
+              # Where the bot on the exit should send customers: the mini app
+              # and the payment page are served by this panel, and the DNS
+              # address they type in is this machine's.
+              "dns": CFG.get("SELF_IP", "")}
+    if CFG.get("PANEL_DOMAIN"):
+        report["panel"] = "https://%s:%d" % (CFG["PANEL_DOMAIN"], PANEL_TLS_PORT)
+    answer = post("/sync", report)
     try:
         save_template_names(answer.get("templates"))
     except Exception as e:
@@ -1156,6 +1169,90 @@ def human_fa(n):
         n /= 1024
 
 
+# ------------------------------------------------ telegram mini app, payment
+# The two pages the Telegram bot links customers to. They are served here, not
+# on the exit, because each needs what only this machine has: the customer's
+# real address for the mini app, and an Iranian server for Zarinpal.
+
+# Telegram hands a mini app its signed launch data in the URL's fragment. Its
+# own script reads it from there too, but that script lives on telegram.org,
+# which is filtered in Iran - so this reads the fragment itself, and uses the
+# script's copy only if some client happens to have loaded it.
+TG_JS = r"""
+(function () {
+  var raw = "";
+  try { raw = (window.Telegram && Telegram.WebApp && Telegram.WebApp.initData) || ""; }
+  catch (e) {}
+  if (!raw) {
+    var parts = location.hash.replace(/^#/, "").split("&");
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i].indexOf("tgWebAppData=") === 0) {
+        try { raw = decodeURIComponent(parts[i].slice(13)); } catch (e) {}
+      }
+    }
+  }
+  if (raw) {
+    document.getElementById("d").value = raw;
+    document.getElementById("b").disabled = false;
+    document.getElementById("n").style.display = "none";
+  }
+})();
+"""
+
+
+def tg_page(ip):
+    """The mini app: the address this page was opened from, and one button."""
+    return ("<div class='icon'>🌐</div><h1>ثبت آی‌پی</h1>"
+            "<p class='sub'>آی‌پی اینترنتی که الان با آن وصل هستید:</p>"
+            "<div class='dns'><div class='big'>%s</div></div>"
+            "<div class='msg warnbox'>قبل از ثبت، <b>فیلترشکن (VPN) را خاموش "
+            "کنید</b> و با همان اینترنتی وصل باشید که سرویس باید رویش کار کند "
+            "(وای‌فای خانه یا اینترنت گوشی). اگر آی‌پی بالا مال فیلترشکن است، "
+            "صفحه را ببندید، فیلترشکن را خاموش کنید و دوباره باز کنید.</div>"
+            "<form method='post' action='/tg/claim'>"
+            "<input type='hidden' name='init_data' id='d'>"
+            "<button id='b' disabled>ثبت همین آی‌پی</button></form>"
+            "<p class='note' id='n'>اگر دکمه فعال نشد، این صفحه را از داخل ربات، "
+            "با دکمهٔ «ثبت خودکار آی‌پی»، باز کنید.</p>"
+            "<script>%s</script>" % (html.escape(ip), TG_JS))
+
+
+def pay_page(ok, message, ref=""):
+    """The end of a mini app or payment round: what happened, and back to the bot."""
+    return ("<div class='icon'>%s</div><h1>%s</h1>%s"
+            "<p class='sub'>می‌توانید این صفحه را ببندید و به ربات برگردید.</p>"
+            % ("✅" if ok else "⚠️", html.escape(message or "خطا"),
+               ("<div class='dns'><div class='k'>کد پیگیری</div>"
+                "<div class='big'>%s</div></div>" % html.escape(str(ref))) if ref else ""))
+
+
+def zarinpal(action, payload):
+    """Call Zarinpal's v4 payment API: its `data` object, or the reason it refused.
+
+    A refusal comes back as a 4xx whose body says why, so that body is read
+    rather than thrown away with the status.
+    """
+    req = urllib.request.Request(
+        "%s/v4/payment/%s.json" % (ZARINPAL, action),
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as res:
+            raw = res.read()
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+    try:
+        answer = json.loads(raw or b"{}")
+    except ValueError:
+        answer = {}
+    if not isinstance(answer, dict):
+        return {}
+    if isinstance(answer.get("data"), dict) and answer["data"]:
+        return answer["data"]
+    errors = answer.get("errors") if isinstance(answer.get("errors"), dict) else {}
+    return {"code": errors.get("code"), "message": errors.get("message", "")}
+
+
 class UserPanel(http.server.BaseHTTPRequestHandler):
     """The page a customer sees.
 
@@ -1179,16 +1276,20 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
 
     def log_request(self, code="-", size="-"):
         # The path only. The query carries nothing but the message shown after
-        # a form, and the cookie - the session - is never written anywhere.
-        log_access(self, "panel", code,
-                   urllib.parse.urlparse(getattr(self, "path", "") or "").path[:120])
+        # a form, or a payment's references on the way back, and the cookie -
+        # the session - is never written anywhere. A payment link's token is
+        # masked as well: it is what opens that order.
+        path = urllib.parse.urlparse(getattr(self, "path", "") or "").path[:120]
+        if path.startswith("/pay/") and path.rstrip("/") != "/pay/back":
+            path = "/pay/…"
+        log_access(self, "panel", code, path)
 
     def client_ip(self):
         # The socket, never a header. Trusting X-Forwarded-For here would let
         # anyone register any address by sending one.
         return self.client_address[0]
 
-    def send_html(self, body, code=200, headers=None):
+    def send_html(self, body, code=200, headers=None, frame=False):
         blob = user_page(body).encode("utf-8")
         # See send(): a clean buffer, so a failed attempt cannot leave half a
         # status line in front of this one.
@@ -1197,7 +1298,14 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(blob)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Frame-Options", "DENY")
+        if frame:
+            # The mini app. Telegram's web client shows it inside a frame of
+            # its own; every other page here refuses to be framed at all.
+            self.send_header("Content-Security-Policy",
+                             "frame-ancestors https://web.telegram.org"
+                             " https://*.telegram.org")
+        else:
+            self.send_header("X-Frame-Options", "DENY")
         self.send_header("X-Content-Type-Options", "nosniff")
         for k, v in (headers or {}).items():
             self.send_header(k, v)
@@ -1275,6 +1383,100 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         return "<div class='msg %s'>%s</div>" % (
             "err" if q.get("e") else "good", html.escape(msg[:200]))
 
+    # -- the bot's mini app and online payment ----------------------------
+    def tg_claim(self):
+        form = self.form()
+        try:
+            res = post("/tg-claim", {"init_data": form.get("init_data", ""),
+                                     "ip": self.client_ip()})
+        except Exception as e:
+            log(ERROR, "panel: tg-claim failed: %s" % e)
+            res = {"ok": False, "message": "الان نشد، چند دقیقه دیگر"}
+        return self.send_html(pay_page(res.get("ok"), res.get("message")), frame=True)
+
+    def pay_start(self, token):
+        """Open a Zarinpal payment for an order the bot created, and go there."""
+        try:
+            order = post("/pay-order", {"token": token})
+        except Exception as e:
+            log(ERROR, "panel: pay-order failed: %s" % e)
+            return self.send_html(pay_page(False, "الان نشد، چند دقیقه دیگر"), 502)
+        if not order.get("ok"):
+            return self.send_html(pay_page(bool(order.get("paid")), order.get("message")))
+        back = "https://%s:%d/pay/back?t=%s" % (
+            CFG["PANEL_DOMAIN"], PANEL_TLS_PORT, urllib.parse.quote(token))
+        try:
+            res = zarinpal("request", {
+                "merchant_id": order["merchant"], "amount": int(order["amount"]),
+                "currency": "IRT", "callback_url": back,
+                "description": order.get("description") or "doctor dns"})
+        except Exception as e:
+            log(ERROR, "panel: zarinpal unreachable: %s" % e)
+            return self.send_html(pay_page(
+                False, "درگاه پرداخت در دسترس نیست؛ کمی بعد دوباره امتحان کنید"), 502)
+        authority = str(res.get("authority") or "")
+        if res.get("code") != 100 or not re.fullmatch(r"[A-Za-z0-9]{8,64}", authority):
+            log(WARN, "panel: zarinpal refused a payment request: %s %s"
+                % (res.get("code"), str(res.get("message") or "")[:160]))
+            return self.send_html(pay_page(False, "درگاه پرداخت درخواست را نپذیرفت"), 502)
+        try:
+            post("/pay-started", {"token": token, "authority": authority})
+        except Exception as e:
+            log(ERROR, "panel: pay-started failed: %s" % e)
+            return self.send_html(pay_page(False, "الان نشد، چند دقیقه دیگر"), 502)
+        return self.send("", 303, {"Location": "%s/StartPay/%s" % (ZARINPAL, authority)})
+
+    def pay_back(self):
+        """Where Zarinpal sends the customer back.
+
+        Nothing in the query is believed except which order it is: the payment
+        is confirmed with Zarinpal itself before the exit hears of it. Opening
+        this page again is safe - Zarinpal answers 101 for a payment already
+        verified, and the exit records an order once.
+        """
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        token = (q.get("t") or [""])[0]
+        authority = (q.get("Authority") or [""])[0]
+        if (q.get("Status") or [""])[0] != "OK":
+            return self.send_html(pay_page(
+                False, "پرداخت انجام نشد یا لغو شد. اگر خواستید، دوباره از ربات اقدام کنید."))
+        try:
+            order = post("/pay-order", {"token": token, "returning": True})
+        except Exception as e:
+            log(ERROR, "panel: pay-order failed: %s" % e)
+            return self.send_html(pay_page(
+                False, "الان نشد. همین صفحه را چند دقیقه بعد دوباره باز کنید."), 502)
+        if not order.get("ok"):
+            return self.send_html(pay_page(bool(order.get("paid")), order.get("message")))
+        if not authority or not hmac.compare_digest(order.get("authority") or "", authority):
+            return self.send_html(pay_page(False, "این پرداخت با سفارش جور نیست"))
+        try:
+            res = zarinpal("verify", {"merchant_id": order["merchant"],
+                                      "amount": int(order["amount"]),
+                                      "authority": authority})
+        except Exception as e:
+            log(ERROR, "panel: zarinpal verify unreachable: %s" % e)
+            return self.send_html(pay_page(
+                False, "تأیید پرداخت الان نشد. همین صفحه را چند دقیقه بعد دوباره باز کنید."), 502)
+        if res.get("code") not in (100, 101):
+            log(WARN, "panel: zarinpal did not verify a payment: %s %s"
+                % (res.get("code"), str(res.get("message") or "")[:160]))
+            return self.send_html(pay_page(
+                False, "پرداخت تأیید نشد. اگر مبلغی از حسابتان کم شده، درگاه آن را برمی‌گرداند."))
+        ref = str(res.get("ref_id") or "")
+        try:
+            done = post("/pay-verified", {"token": token, "authority": authority,
+                                          "ref_id": ref, "card_pan": res.get("card_pan") or ""})
+        except Exception as e:
+            # Paid and confirmed, not yet recorded. Opening this page again
+            # verifies once more and records it then.
+            log(ERROR, "panel: pay-verified failed for a confirmed payment (ref %s): %s"
+                % (ref, e))
+            return self.send_html(pay_page(
+                False, "پرداخت انجام شد ولی ثبتش الان نشد. همین صفحه را چند دقیقه بعد "
+                       "دوباره باز کنید.", ref), 502)
+        return self.send_html(pay_page(done.get("ok"), done.get("message"), ref))
+
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
 
@@ -1298,6 +1500,13 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         if path == "/logout":
             return self.send("", 303, {"Location": "/",
                                        "Set-Cookie": "sdu=; Path=/; Max-Age=0"})
+
+        if path == "/tg":
+            return self.send_html(tg_page(self.client_ip()), frame=True)
+        if path == "/pay/back":
+            return self.pay_back()
+        if path.startswith("/pay/"):
+            return self.pay_start(path[len("/pay/"):])
 
         if path != "/":
             return self.send_html("<div class='icon'>❔</div><h1>صفحه پیدا نشد</h1>", 404)
@@ -1383,6 +1592,9 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                 return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
             return self.redirect("/", res.get("message", ""),
                                  bad=not res.get("ok"))
+
+        if path == "/tg/claim":
+            return self.tg_claim()
 
         if path != "/register-ip":
             return self.send_html("<h1>404</h1>", 404)

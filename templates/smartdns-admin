@@ -723,8 +723,12 @@ class Admin(http.server.BaseHTTPRequestHandler):
         p = CFG["ADMIN_PATH"]
         rows = STORE.q(
             "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
-            " length(t.receipt_blob) AS size"
+            " length(t.receipt_blob) AS size,"
+            " (SELECT name FROM plans WHERE id = t.plan_id) AS plan_name"
             " FROM transactions t JOIN users u ON u.id = t.user_id"
+            # An online payment link that was opened and never paid is not a
+            # decision anybody made, and below it would read as a rejection.
+            " WHERE t.status != 'started'"
             " ORDER BY CASE t.status WHEN 'pending' THEN 0 ELSE 1 END,"
             " t.created_at DESC LIMIT 100")
         pending = [r for r in rows if r["status"] == "pending"]
@@ -735,6 +739,8 @@ class Admin(http.server.BaseHTTPRequestHandler):
             who = (r["first_name"] or "") + " · " + (
                 r["username"] or r["phone"]
                 or str(r["telegram_id"] or "#%d" % r["user_id"]))
+            if r["plan_name"]:
+                who += " · پلن %s" % r["plan_name"]
             out.append(
                 "<div class='receipt'>"
                 "<div class='who'>%s<span class='muted'> · %s · %s</span></div>"
@@ -1447,6 +1453,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                    "</div><button>تغییر رمز</button></form>"
                    "<p class='muted'>رمز ذخیره نمی‌شود، فقط هشش. با تغییر آن "
                    "همهٔ نشست‌های دیگر بسته می‌شوند.</p></div>" % p)
+        out.append(bot_card())
         return "".join(out)
 
     def logs(self):
@@ -1516,6 +1523,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                     if joining:
                         STORE.run("UPDATE users SET status = 'active'"
                                   " WHERE id = ?", (uid,))
+                        tell(uid, MSG_ACTIVATED)
                     return self.redirect(
                         "users?m=ذخیره شد؛ بدون محدودیت زمانی"
                         + ("؛ حساب فعال شد" if joining else ""))
@@ -1539,6 +1547,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
             if joining:
                 STORE.run("UPDATE users SET status = 'active' WHERE id = ?",
                           (uid,))
+                tell(uid, MSG_ACTIVATED)
                 return self.redirect("users?m=ذخیره شد؛ حساب فعال شد")
             return self.redirect("users?m=ذخیره شد")
 
@@ -1550,11 +1559,22 @@ class Admin(http.server.BaseHTTPRequestHandler):
             # The image goes with the decision. It was evidence for a judgement
             # that has now been made, and keeping every customer's bank slip
             # for ever is a liability rather than a record.
+            # settled = 0 hands the rest to smartdns-panel and the bot: a
+            # receipt sent for a plan gets that plan applied, and a customer
+            # with a Telegram is told either way.
             STORE.run("UPDATE transactions SET status = ?, decided_at = ?,"
-                      " receipt_blob = NULL WHERE id = ?", (to, now(), tid))
-            return self.redirect(
-                "receipts?m=%s" % ("رسید تأیید شد؛ حالا سهمیه و زمانش را بگذارید"
-                                   if to == "approved" else "رسید رد شد"))
+                      " receipt_blob = NULL, settled = 0 WHERE id = ?",
+                      (to, now(), tid))
+            plan = STORE.one("SELECT p.name FROM transactions t JOIN plans p"
+                             " ON p.id = t.plan_id WHERE t.id = ?", (tid,))
+            if to == "approved" and plan:
+                done = ("رسید تأیید شد؛ پلن «%s» تا چند ثانیه دیگر روی حساب اعمال می‌شود"
+                        % plan["name"])
+            elif to == "approved":
+                done = "رسید تأیید شد؛ حالا سهمیه و زمانش را بگذارید"
+            else:
+                done = "رسید رد شد"
+            return self.redirect("receipts?m=%s" % done)
 
         if rest == "user-status":
             uid = int(one("id") or 0)
@@ -1741,6 +1761,32 @@ class Admin(http.server.BaseHTTPRequestHandler):
                       (self.session_token(),))
             return self.redirect("settings?m=رمز عوض شد")
 
+        if rest == "bot-token":
+            if one("clear"):
+                set_setting("bot_token", "")
+                set_setting("bot_username", "")
+                return self.redirect("settings?m=ربات قطع شد")
+            token = one("bot_token").strip()
+            if not BOT_TOKEN_RE.match(token):
+                return self.redirect("settings?m=!این توکن درست نیست؛ همان را که "
+                                     "BotFather داد کامل بگذارید")
+            if token != setting("bot_token"):
+                set_setting("bot_token", token)
+                set_setting("bot_username", "")
+            new_admin_code()
+            return self.redirect("settings?m=توکن ذخیره شد؛ ربات تا چند ثانیه دیگر وصل می‌شود")
+
+        if rest == "bot-code":
+            new_admin_code()
+            return self.redirect("settings?m=کد مدیریت تازه ساخته شد")
+
+        if rest == "bot-admin-del":
+            gone = one("id").strip()
+            set_setting("bot_admins", ",".join(
+                a.strip() for a in setting("bot_admins").split(",")
+                if a.strip() and a.strip() != gone))
+            return self.redirect("settings?m=مدیر ربات حذف شد")
+
         return self.lost()
 
 
@@ -1764,6 +1810,101 @@ def clean_domain(raw):
     if any(d == f or d.endswith("." + f) for f in FORBIDDEN):
         raise ValueError("این دامنه را نمی‌شود مسیر داد")
     return d
+
+
+# ------------------------------------------------------------ telegram bot
+# The bot is smartdns-bot, reading its settings from this same database. This
+# panel only sets them - the token, and who may become the bot's admin - and
+# queues a message when it changes an account; it never talks to Telegram.
+BOT_TOKEN_RE = re.compile(r"^\d{5,15}:[A-Za-z0-9_-]{30,64}$")
+MSG_ACTIVATED = ("✅ حساب شما فعال شد.\n"
+                 "اگر هنوز آی‌پی اینترنتتان را ثبت نکرده‌اید، از «🌐 ثبت آی‌پی» ثبتش کنید.")
+
+
+def setting(key, default=""):
+    row = STORE.one("SELECT value FROM settings WHERE key = ?", (key,))
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
+    STORE.run("INSERT INTO settings (key, value) VALUES (?, ?)"
+              " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+              (key, str(value)))
+
+
+def new_admin_code(hours=24):
+    # The same shape smartdns-panel's new_admin_code writes, which the bot reads.
+    until = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat(
+        timespec="seconds")
+    code = secrets.token_hex(4)
+    set_setting("bot_admin_code", "%s|%s" % (code, until))
+    return code
+
+
+def mask_token(token):
+    return (token[:6] + "…" + token[-4:]) if len(token) > 12 else "…"
+
+
+def tell(user_id, text):
+    """Queue a Telegram message for an account, if it has a Telegram."""
+    try:
+        STORE.run("INSERT INTO outbox (chat_id, text, created_at)"
+                  " SELECT telegram_id, ?, ? FROM users"
+                  " WHERE id = ? AND telegram_id IS NOT NULL",
+                  (text, now(), user_id))
+    except sqlite3.OperationalError as e:
+        log(WARN, "message for user %d not queued: %s" % (user_id, e))
+
+
+def bot_card():
+    """The Telegram bot: its token, the code that makes somebody its admin,
+    and who already is. Plans, the card number and Zarinpal are set inside
+    the bot itself, where the operator who sells is."""
+    p = CFG["ADMIN_PATH"]
+    token = setting("bot_token")
+    name = setting("bot_username")
+    admins = [a.strip() for a in setting("bot_admins").split(",") if a.strip()]
+    code, _, until = setting("bot_admin_code").partition("|")
+    due = parse_ts(until)
+    live = bool(code) and bool(due) and due > datetime.now(timezone.utc)
+    out = ["<div class='card'><h2>ربات تلگرام</h2>"]
+    if token:
+        out.append("<p>ربات: <b>%s</b> · توکن: <code dir='ltr'>%s</code></p>"
+                   % (html.escape("@" + name if name else "در حال اتصال…"),
+                      html.escape(mask_token(token))))
+    else:
+        out.append("<p class='muted'>هنوز رباتی وصل نیست. در تلگرام با "
+                   "<code>@BotFather</code> یک ربات بسازید و توکنش را اینجا "
+                   "بگذارید.</p>")
+    out.append("<form method='post' action='/%s/bot-token' class='row'>"
+               "<input name='bot_token' placeholder='123456789:AA...' dir='ltr'"
+               " autocomplete='off' style='min-width:280px'>"
+               "<button>%s</button></form>"
+               % (p, "عوض کردن توکن" if token else "ذخیرهٔ توکن"))
+    if token:
+        if live:
+            out.append("<div class='msg good'>برای مدیر ربات شدن، این را به ربات "
+                       "بفرستید: <code dir='ltr'>/admin %s</code><br>"
+                       "<span class='muted'>یک بار کار می‌کند و تا %s (UTC) "
+                       "معتبر است.</span></div>"
+                       % (html.escape(code), html.escape(until[:16].replace("T", " "))))
+        out.append("<form method='post' action='/%s/bot-code' class='row'>"
+                   "<button class='ghost'>کد مدیریت تازه</button></form>" % p)
+        out.append("<h2 style='margin-top:18px'>مدیرهای ربات</h2>")
+        if not admins:
+            out.append("<p class='muted'>هنوز کسی مدیر ربات نشده.</p>")
+        for a in admins:
+            out.append("<form method='post' action='/%s/bot-admin-del' class='row'>"
+                       "<code dir='ltr'>%s</code><input type='hidden' name='id' value='%s'>"
+                       "<button class='danger'>حذف</button></form>"
+                       % (p, html.escape(a), html.escape(a)))
+        out.append("<form method='post' action='/%s/bot-token' class='row'"
+                   " style='margin-top:14px' onsubmit='return confirm(\"ربات قطع شود؟\")'>"
+                   "<input type='hidden' name='clear' value='1'>"
+                   "<button class='danger'>قطع ربات</button></form>" % p)
+    out.append("<p class='muted'>پلن‌ها، شمارهٔ کارت و مرچنت زرین‌پال از داخل خود "
+               "ربات، در منوی «🛠 مدیریت»، تنظیم می‌شوند.</p></div>")
+    return "".join(out)
 
 
 def set_config_key(key, value):

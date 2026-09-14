@@ -47,8 +47,8 @@ if [ -f "$ETC/sync.env" ]; then
     done
 elif [ -f "$ETC/panel.env" ]; then
     role=exit
-    status="smartdns-panel smartdns-admin nginx smartdns-cert.timer"
-    logs="smartdns-panel smartdns-admin nginx smartdns-cert"
+    status="smartdns-panel smartdns-admin smartdns-bot nginx smartdns-cert.timer"
+    logs="smartdns-panel smartdns-admin smartdns-bot nginx smartdns-cert"
 else
     echo "doctor dns is not installed on this machine" >&2
     exit 1

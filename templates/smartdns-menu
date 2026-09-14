@@ -194,6 +194,14 @@ menu_admin() {
         'new path and new password at once   (smartdns-access rotate)|sure "the old address and password stop working - go ahead?" && run smartdns-access rotate'
 }
 
+menu_bot() {
+    choose "Telegram bot" \
+        'its token, name, admins and the relay it links to   (smartdns-bot status)|run smartdns-bot status' \
+        'set the bot token   (smartdns-bot token)|run smartdns-bot token' \
+        'a one-time code for becoming its admin   (smartdns-bot code)|run smartdns-bot code' \
+        'switch the bot off   (smartdns-bot off)|sure "the bot stops answering customers - go ahead?" && run smartdns-bot off'
+}
+
 menu_tunnel() {
     choose "Tunnel between the relay and the exit" \
         'is it on, and carrying traffic?   (smartdns-tunnel)|run smartdns-tunnel' \
@@ -235,6 +243,7 @@ main() {
             'tunnel to the relay|menu_tunnel'
             'restart everything   (smartdns-restart)|restart_all'
             'installation, updates and certificates|menu_install'
+            'telegram bot|menu_bot'
         )
     fi
     BACK=quit choose "doctor dns $VERSION - $role" "${items[@]}"

@@ -59,6 +59,7 @@ certificate naming no console host at all.
 | **Speed limits** | a per-customer download cap, shaped with htb + fq_codel rather than by dropping packets |
 | **Service templates** | which brands a customer's plan routes, down to individual domains; a few groups ship visible but unticked, because routing them breaks the thing they belong to |
 | **Customer panel** | sign up, register an address, see usage, send a payment receipt |
+| **Telegram bot** | the customer panel in Telegram, plus buying a plan - card to card or Zarinpal - and the operator's receipts, customers, plans and broadcasts |
 | **Operator panel** | customers, templates, domains, host monitoring, backup and restore |
 | **TLS** | certificates obtained and renewed automatically, asking for nothing but a domain name |
 
@@ -481,6 +482,87 @@ sudo bash doctor-dns.sh --uninstall
 console downloads through a relay stall for that long and resume. A timer
 renews on its own once there is something to renew.
 
+## The Telegram bot
+
+Everything a customer does on the relay's page, they can do in a Telegram bot
+as well - and buy a plan there, which the page cannot. The operator runs the
+service from the same bot.
+
+It runs on the exit, as `smartdns-bot`, because Telegram is filtered inside
+Iran. It is installed with the exit and does nothing until it has a token. It
+listens on no port: it only dials out to Telegram.
+
+### Setting it up
+
+1. In Telegram, create a bot with [@BotFather](https://t.me/BotFather) and copy
+   its token.
+2. In the admin panel, **Settings → Telegram bot**, paste the token. The bot
+   connects within a few seconds.
+3. The same card shows a one-time code. Send `/admin <code>` to your bot: you
+   are its admin, and a **🛠 مدیریت** button appears in its menu. A code works
+   once, for 24 hours; the card makes a fresh one for each admin you add.
+4. In the bot, under **🛠 مدیریت**, create plans and set a card number, a
+   Zarinpal merchant ID, or both.
+
+Or over ssh:
+
+```sh
+sudo smartdns-bot token          # asks for the token, prints an admin code
+sudo smartdns-bot code           # a fresh admin code
+sudo smartdns-bot status         # token, bot name, admins, the relay it links to
+sudo smartdns-bot off            # forget the token
+```
+
+### What customers can do
+
+| | |
+|---|---|
+| **`/start`** | opens an account - pending, with nothing, like a web signup |
+| **👤 حساب من** | status, plan, registered address, usage, allowance, speed, end date |
+| **🛒 خرید / تمدید** | pick a plan, then pay card to card (a photo of the receipt) or online through Zarinpal |
+| **🌐 ثبت آی‌پی** | a mini app that registers the address the phone is on, or type one in |
+| **📡 آدرس DNS** | the address to put in a console, phone or router |
+
+The bot messages them on its own: at 80% and 95% of the allowance, when it
+runs out or the period ends, when a receipt is approved or rejected, and when
+the account is activated.
+
+Buying renews. The allowance becomes the plan's, usage starts from zero and the
+period counts from that day. A plan can carry a template, which the account is
+moved to.
+
+### What the operator can do
+
+Under **🛠 مدیریت**:
+
+- **Receipts** - each new one arrives with its photo and approve and reject
+  buttons. Approving applies the plan it was sent for. A receipt approved in the
+  admin panel has its plan applied too.
+- **Customers** - find one by name, id, Telegram id or address; set the
+  allowance, days and speed, apply a plan, change template, reset usage, suspend.
+- **Plans** - create, edit, stop selling, delete.
+- **Payment methods** - the card number and its holder, the Zarinpal merchant ID.
+- **Stats** - customers by status, receipts waiting, sales over 30 days, and each
+  server's health.
+- **Broadcast** - one message to everybody who has started the bot, after a
+  preview.
+
+### The mini app and online payment
+
+Both are pages on the relay, because each needs something only the relay has:
+the customer's real address, and an Iranian server for Zarinpal to answer and
+send the customer back to. So both need the relay to have a domain and a
+certificate, the same as its customer panel. The relay tells the exit where its
+pages are on every sync; until one with a domain has synced, the bot offers
+only typing an address and paying card to card.
+
+- **The mini app** sees whatever address the phone is using. With a VPN on, that
+  is the VPN's - the page says to turn it off first.
+- **Zarinpal** has to accept the relay's return address: register the relay's
+  domain, which the bot shows under payment methods, as your website in the
+  Zarinpal panel. A payment is confirmed with Zarinpal from the relay before
+  anything is recorded, and only against the order it was started for.
+
 ## How it is built
 
 `doctor-dns.sh` is generated, not hand-edited. Everything lives in
@@ -529,10 +611,17 @@ reach the service from.
   a password, and nothing here asks for a password over plain HTTP — so it is
   not served at all rather than served unsafely. Nobody can sign up or
   register an address on such a relay until it is given a domain.
-- **Selling is not built, and there is no trial.** Signing up gets an account,
-  a password, and somewhere to send a receipt — no traffic. The account waits
-  until an operator opens its row and gives it a plan, which is the moment it
-  becomes able to connect at all.
+- **There is no trial.** Signing up gets an account and somewhere to send a
+  receipt — no traffic. An account becomes able to connect when a plan is
+  bought in the Telegram bot, or when an operator gives it one.
+- **Plans are sold only in the bot.** The web page takes a receipt but cannot
+  pick a plan or pay online; an operator approving that receipt sets the
+  allowance by hand.
+- **With several relays, the bot links to one.** The mini app and the payment
+  page are on whichever relay with a domain synced last.
+- **The mini app has not been tried on every Telegram client.** It reads its
+  launch data from the page's address rather than from Telegram's script,
+  which is filtered in Iran; typing the address in the bot always works.
 - **Xbox downloads stall** regardless of whether they are routed. Measured,
   not solved.
 - **Traffic costs double.** One customer gigabyte is about two on the relay
