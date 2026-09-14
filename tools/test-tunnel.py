@@ -282,6 +282,21 @@ check("the checks load a site through the tunnel's own end, not through nginx",
       '--connect-to "github.com:443:127.0.0.1:$TUNNEL_LOCAL_HTTPS"' in LOGIC)
 check("uninstall removes the tunnel's firewall table", "nft delete table inet smartdns_tunnel;" in LOGIC)
 
+print("credit where it is due")
+check("the installer names BackPack's author when it installs it",
+      'info "BackPack is the work of Amin Mohammadi' in inst)
+check("and so does smartdns-tunnel's help",
+      "Amin Mohammadi" in read("templates", "smartdns-tunnel")
+      and "github.com/AminMGMT/BackPack" in read("templates", "smartdns-tunnel"))
+if all(os.path.exists(os.path.join(ROOT, n)) for n in ("README.md", "README.fa.md")):
+    for n, heading in (("README.md", "## Credits"), ("README.fa.md", "## سپاس")):
+        txt = read(n)
+        check("%s credits him, with the licence" % n,
+              heading in txt and ("Amin Mohammadi" in txt or "امین محمدی" in txt)
+              and "AGPL-3.0" in txt and "github.com/AminMGMT/BackPack" in txt)
+else:
+    print("  --   not the published tree - README credits skipped")
+
 print("its service, and the tools that know it")
 unit = read("templates", "smartdns-tunnel.service")
 check("the service runs BackPack from its own config",

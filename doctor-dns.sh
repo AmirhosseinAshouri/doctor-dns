@@ -171,10 +171,11 @@ enable_service() {
 }
 
 # ------------------------------------------------------------------ tunnel
-# An optional tunnel between the relay and the exit, carried by BackPack
-# (github.com/AminMGMT/BackPack, AGPL-3.0). Its binary is fetched from its own
-# releases when asked for and checked against the hashes pinned here - never
-# copied into this project, and never a version nobody here has tried.
+# An optional tunnel between the relay and the exit, carried by BackPack - the
+# work of Amin Mohammadi (github.com/AminMGMT/BackPack, AGPL-3.0). Its binary is
+# fetched from his own releases when asked for and checked against the hashes
+# pinned here - never copied into this project, and never a version nobody here
+# has tried.
 BACKPACK_VERSION="v1.8.0"
 BACKPACK_SHA_amd64="0fca707e413c0ca051fac1bf47a8f5bc870bc54a67866415b75fd93fbd91f9b8"
 BACKPACK_SHA_arm64="b93d4b1c76d44e2168a66f7e3e27173b07682d012b3cdf3917f768ea7064a764"
@@ -341,6 +342,7 @@ install_backpack() {
     printf '%s %s\n' "$BACKPACK_VERSION" "$sha" > "$BACKPACK_BIN.version"
     rm -rf "$tmp"
     info "BackPack $BACKPACK_VERSION installed, its hash checked"
+    info "BackPack is the work of Amin Mohammadi - github.com/AminMGMT/BackPack (AGPL-3.0)"
 }
 
 # The tunnel's config for this end, on stdout.
@@ -9897,6 +9899,9 @@ exit 0
 ## moment its end of the tunnel stops answering, whichever machine stopped it.
 ## To change the transport, the port or which end dials, run the installer with
 ## --tunnel on the exit and then on the relay.
+##
+## The tunnel itself is BackPack, the work of Amin Mohammadi:
+## github.com/AminMGMT/BackPack (AGPL-3.0).
 #set -uo pipefail
 #
 ## Where this machine's config lives. A variable only so a test can point it
@@ -9907,7 +9912,7 @@ exit 0
 #
 #case "${1:-status}" in
 #    status|off|on) ;;
-#    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+#    -h|--help) sed -n '2,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
 #    *) echo "unknown command: $1  (try -h)" >&2; exit 1 ;;
 #esac
 #[ "$(id -u)" = 0 ] || { echo "run as root:  sudo smartdns-tunnel" >&2; exit 1; }

@@ -9,6 +9,9 @@
 # moment its end of the tunnel stops answering, whichever machine stopped it.
 # To change the transport, the port or which end dials, run the installer with
 # --tunnel on the exit and then on the relay.
+#
+# The tunnel itself is BackPack, the work of Amin Mohammadi:
+# github.com/AminMGMT/BackPack (AGPL-3.0).
 set -uo pipefail
 
 # Where this machine's config lives. A variable only so a test can point it
@@ -19,7 +22,7 @@ LOCAL_HTTPS=18443
 
 case "${1:-status}" in
     status|off|on) ;;
-    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown command: $1  (try -h)" >&2; exit 1 ;;
 esac
 [ "$(id -u)" = 0 ] || { echo "run as root:  sudo smartdns-tunnel" >&2; exit 1; }

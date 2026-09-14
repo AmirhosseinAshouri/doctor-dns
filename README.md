@@ -215,7 +215,7 @@ every site shows on the way, and on some routes filtering acts on exactly that
 slowed to a crawl.
 
 The installer can put a [BackPack](https://github.com/AminMGMT/BackPack) tunnel
-on that link instead. The exit asks when it is installed — plain TCP or
+— Amin Mohammadi's work, see [Credits](#credits) — on that link instead. The exit asks when it is installed — plain TCP or
 BackPack, which transport, which end dials, which port — and the relay learns
 the answer from the pairing token, so the two ends cannot disagree. Customers
 notice nothing: DNS, the allowlist, usage, speed limits and both panels all sit
@@ -541,6 +541,16 @@ reach the service from.
 ## Contributors
 
 - [Armin Toranj](https://github.com/arminandtoo) — `@arminandtoo`
+
+## Credits
+
+- **[BackPack](https://github.com/AminMGMT/BackPack)**, by **Amin Mohammadi**
+  ([@AminMGMT](https://github.com/AminMGMT)), carries the optional tunnel
+  between the relay and the exit. It is his work, released under the AGPL-3.0:
+  this project only downloads his own unmodified releases, checks them against
+  a pinned hash, and runs them. Thank you, Amin.
+- The exit's nginx configuration started from
+  [rohammosalli/smart-dns](https://github.com/rohammosalli/smart-dns).
 
 ---
 
