@@ -31,6 +31,12 @@ except Exception:
     pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# These tests talk to a server of their own on 127.0.0.1. A system-wide proxy -
+# macOS settings, or http_proxy in the environment - would have urllib send even
+# those requests to the proxy, which answers a local port it knows nothing about
+# with 503. Nothing here should ever leave the machine, so proxying is off.
+os.environ["no_proxy"] = os.environ["NO_PROXY"] = "*"
 fails = []
 
 

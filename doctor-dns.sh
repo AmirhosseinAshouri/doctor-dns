@@ -3550,6 +3550,10 @@ exit 0
 #    # nor forwarded; code that creates work sets them to 0.
 #    ("transactions", "settled", "INTEGER NOT NULL DEFAULT 1"),
 #    ("transactions", "admin_notified", "INTEGER NOT NULL DEFAULT 1"),
+#    # When this account took the one free trial it gets. Null is "never",
+#    # which is what every account that predates the trial gets - so nobody
+#    # is refused one because of when they signed up.
+#    ("users", "trial_at", "TEXT"),
 #]
 #
 ## Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -3588,10 +3592,16 @@ exit 0
 ## rather than in this file, so changing either is an edit in the admin panel
 ## rather than a redeploy to every machine.
 #DEFAULT_SETTINGS = {
-#    # No trial. A new account gets nothing until an operator gives it
-#    # something - see create_web_user.
 #    "plan_bytes": str(2 * GB),
 #    "plan_days": "30",
+#    # The free trial, offered in the bot to an account that has never had
+#    # anything. One per Telegram account, recorded in users.trial_at. The
+#    # operator sets these from the bot; "trial_on" empty switches it off, and
+#    # so does a length of zero.
+#    "trial_on": "1",
+#    "trial_gb": "1",
+#    "trial_hours": "24",
+#    "trial_mbps": "0",
 #}
 #
 ## Fractions of the quota at which the user is warned, and the bit each one
@@ -4573,6 +4583,78 @@ exit 0
 #    if age > (INIT_DATA_MAX_AGE if max_age is None else max_age) or age < -300:
 #        return None
 #    return user
+#
+#
+#def trial_settings(store):
+#    return {"on": store.setting("trial_on", "1") == "1",
+#            "gb": float(store.setting("trial_gb", "1") or 0),
+#            "hours": float(store.setting("trial_hours", "24") or 0),
+#            "mbps": float(store.setting("trial_mbps", "0") or 0)}
+#
+#
+#def trial_summary(store):
+#    t = trial_settings(store)
+#    parts = [("%g گیگ" % t["gb"]) if t["gb"] else "حجم نامحدود", "%g ساعت" % t["hours"]]
+#    if t["mbps"]:
+#        parts.append("%g مگابیت" % t["mbps"])
+#    return " · ".join(parts)
+#
+#
+#def trial_reason(store, user):
+#    """Why this account cannot take the free trial, or "" if it can.
+#
+#    A reason rather than a yes or no, because every caller wants to say what
+#    the matter is. Only an account that has never had anything is offered one:
+#    a customer whose plan has run out is asked to buy, not given another
+#    trial.
+#    """
+#    t = trial_settings(store)
+#    if not t["on"] or t["hours"] <= 0:
+#        return "تست رایگان الان فعال نیست"
+#    if not user["telegram_id"]:
+#        return "تست رایگان فقط از داخل ربات تلگرام گرفته می‌شود"
+#    if user["trial_at"]:
+#        return "تست رایگان این حساب قبلاً گرفته شده"
+#    if user["status"] == "suspended":
+#        return "این حساب مسدود است"
+#    if user["status"] != "pending":
+#        return "تست رایگان فقط برای حسابی است که هنوز پلنی نداشته"
+#    return ""
+#
+#
+#def grant_trial(store, user_id):
+#    """Hand out the one free trial an account gets: (ok, why not).
+#
+#    One statement does the giving and the recording, and only while trial_at is
+#    still null, so two taps a moment apart cannot take two trials - the second
+#    changes no rows and is told so.
+#    """
+#    user = store.one("SELECT * FROM users WHERE id = ?", (user_id,))
+#    if not user:
+#        return False, "حساب پیدا نشد"
+#    reason = trial_reason(store, user)
+#    if reason:
+#        return False, reason
+#    t = trial_settings(store)
+#    ends = (datetime.now(timezone.utc) + timedelta(hours=t["hours"])).isoformat(
+#        timespec="seconds")
+#    stamp = now()
+#    changed = store.run(
+#        "UPDATE users SET quota_bytes = ?, used_bytes = 0, warned = 0, speed_kbps = ?,"
+#        " quota_mode = 'oneoff', quota_reset_at = NULL, expires_at = ?,"
+#        " status = 'active', trial_at = ?"
+#        " WHERE id = ? AND trial_at IS NULL AND status = 'pending'",
+#        (int(t["gb"] * GB), int(t["mbps"] * 1000), ends, stamp, user_id)).rowcount
+#    if changed != 1:
+#        return False, "تست رایگان این حساب قبلاً گرفته شده"
+#    # Recorded like a payment of nothing, so the trials show up beside the
+#    # sales rather than only as a date on the account.
+#    store.run(
+#        "INSERT INTO transactions (user_id, amount, kind, status, note, created_at,"
+#        " decided_at) VALUES (?, 0, 'trial', 'approved', 'trial', ?, ?)",
+#        (user_id, stamp, stamp))
+#    print("trial: user %d, %s until %s" % (user_id, trial_summary(store), ends), flush=True)
+#    return True, ""
 #
 #
 #def apply_plan(store, user_id, plan):
@@ -9651,6 +9733,10 @@ exit 0
 #            "speed_mbps": mbps, "price": int(price)}, ""
 #
 #
+#def store_trials(store):
+#    return store.one("SELECT count(*) c FROM users WHERE trial_at IS NOT NULL")["c"]
+#
+#
 #def days_left(stamp):
 #    due = P.parse_ts(stamp)
 #    if not due:
@@ -9822,6 +9908,8 @@ exit 0
 #            return self.say(chat_id, "باشد، لغو شد.", self.menu(chat_id))
 #        if data == "buy":
 #            return self.buy(chat_id, user)
+#        if data == "trial":
+#            return self.take_trial(chat_id, user)
 #        if data == "ip":
 #            return self.ip(chat_id, user)
 #        if data == "typeip":
@@ -9900,17 +9988,37 @@ exit 0
 #        elif user["quota_reset_at"]:
 #            lines.append("تمدید حجم: %s" % user["quota_reset_at"][:10])
 #        if user["status"] == "pending" and not admin:
-#            lines.append("\nبرای شروع، از «🛒 خرید / تمدید» یک پلن بخرید.")
+#            if P.trial_reason(self.store, user):
+#                lines.append("\nبرای شروع، از «🛒 خرید / تمدید» یک پلن بخرید.")
+#            else:
+#                lines.append("\n🎁 یک تست رایگان %s دارید — از «🛒 خرید / تمدید» بگیریدش."
+#                             % P.trial_summary(self.store))
 #        elif not ips and not admin:
 #            lines.append("\nآی‌پی‌تان هنوز ثبت نشده؛ تا ثبت نشود سرویس کار نمی‌کند.")
 #        return "\n".join(lines)
 #
 #    def buy(self, chat, user):
+#        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+#        rows = []
+#        if not P.trial_reason(self.store, user):
+#            rows.append([btn("🎁 تست رایگان %s" % P.trial_summary(self.store), "trial")])
 #        plans = self.store.q("SELECT * FROM plans WHERE active = 1 ORDER BY price, id")
-#        if not plans:
+#        rows += [[btn(P.plan_summary(p), "plan:%d" % p["id"])] for p in plans]
+#        if not rows:
 #            return self.say(chat, "هنوز پلنی برای فروش گذاشته نشده. کمی بعد دوباره سر بزنید.")
-#        self.say(chat, "یک پلن انتخاب کنید:",
-#                 kb(*[[btn(P.plan_summary(p), "plan:%d" % p["id"])] for p in plans]))
+#        self.say(chat, "یکی را انتخاب کنید:" if plans else "تست رایگان را می‌توانید بگیرید:",
+#                 kb(*rows))
+#
+#    def take_trial(self, chat, user):
+#        ok, why = P.grant_trial(self.store, user["id"])
+#        if not ok:
+#            return self.say(chat, "⚠️ " + why, self.menu(chat))
+#        P.log(P.INFO, "bot: trial taken by user %d" % user["id"])
+#        self.say(chat, "🎁 تست رایگان شما فعال شد: %s\n\nدو کار مانده:\n"
+#                       "۱. از «🌐 ثبت آی‌پی» آی‌پی اینترنتتان را ثبت کنید.\n"
+#                       "۲. از «📡 آدرس DNS» آدرس را در کنسول، گوشی یا مودم بگذارید.\n\n"
+#                       "بعد از تمام شدن تست، از «🛒 خرید / تمدید» پلن بگیرید."
+#                 % P.trial_summary(self.store), self.menu(chat))
 #
 #    def pick_plan(self, chat, plan_id):
 #        plan = self.store.one("SELECT * FROM plans WHERE id = ? AND active = 1", (plan_id,))
@@ -10077,7 +10185,8 @@ exit 0
 #        self.say(chat, "🛠 مدیریت", kb(
 #            [btn("📥 رسیدها (%d)" % pending, "a:rc"), btn("👥 کاربران", "a:us")],
 #            [btn("📦 پلن‌ها", "a:pl"), btn("💳 روش‌های پرداخت", "a:py")],
-#            [btn("📊 آمار", "a:st"), btn("📢 پیام همگانی", "a:bc")]))
+#            [btn("🎁 تست رایگان", "a:tr"), btn("📊 آمار", "a:st")],
+#            [btn("📢 پیام همگانی", "a:bc")]))
 #
 #    def ask(self, chat, state, text):
 #        self.state[chat] = state
@@ -10088,7 +10197,7 @@ exit 0
 #        cmd = parts[0]
 #        ids = [int(x) for x in parts[1:] if x.isdigit()]
 #        pages = {"rc": self.admin_receipts, "us": self.admin_users, "pl": self.admin_plans,
-#                 "py": self.admin_payments, "st": self.admin_stats}
+#                 "py": self.admin_payments, "st": self.admin_stats, "tr": self.admin_trial}
 #        if cmd in pages:
 #            return pages[cmd](chat)
 #        if cmd in ("ok", "no") and ids:
@@ -10156,6 +10265,16 @@ exit 0
 #                self.store.run("DELETE FROM plans WHERE id = ?", (ids[0],))
 #                self.say(chat, "🗑 پلن حذف شد.")
 #            return self.admin_plans(chat)
+#        if cmd in ("trg", "trh", "trs"):
+#            state, text = {
+#                "trg": ("admin-trial-gb", "حجم تست رایگان به گیگابایت (۰ یعنی نامحدود):"),
+#                "trh": ("admin-trial-hours", "مدت تست رایگان به ساعت (۰ یعنی خاموش):"),
+#                "trs": ("admin-trial-speed", "سرعت تست رایگان به مگابیت بر ثانیه (۰ یعنی بی‌حد):"),
+#            }[cmd]
+#            return self.ask(chat, (state,), text)
+#        if cmd == "trx":
+#            self.store.set_setting("trial_on", "" if P.trial_settings(self.store)["on"] else "1")
+#            return self.admin_trial(chat)
 #        if cmd == "pc":
 #            return self.ask(chat, ("admin-card",), "شمارهٔ کارت و نام صاحب کارت را این‌طور "
 #                                                   "بفرستید:\n6037 9912 3456 7890 | علی رضایی")
@@ -10208,6 +10327,19 @@ exit 0
 #                done = "سرعت ذخیره شد"
 #            self.say(chat, "✅ %s%s" % (done, "؛ حساب فعال شد" if joined else ""))
 #            return self.user_card(chat, uid)
+#        if kind.startswith("admin-trial-"):
+#            try:
+#                value = number(text)
+#            except ValueError:
+#                return self.say(chat, "یک عدد بفرستید.", cancel_kb())
+#            if value < 0:
+#                return self.say(chat, "عدد منفی نمی‌شود.", cancel_kb())
+#            self.state.pop(chat, None)
+#            self.store.set_setting({"admin-trial-gb": "trial_gb",
+#                                    "admin-trial-hours": "trial_hours",
+#                                    "admin-trial-speed": "trial_mbps"}[kind], "%g" % value)
+#            self.say(chat, "✅ ذخیره شد.")
+#            return self.admin_trial(chat)
 #        if kind in ("admin-plan-new", "admin-plan-edit"):
 #            plan, why = parse_plan(text)
 #            if not plan:
@@ -10440,6 +10572,19 @@ exit 0
 #             btn("🗑 حذف", "a:pd:%d" % pid)],
 #            [btn("↩️ همهٔ پلن‌ها", "a:pl")]))
 #
+#    # the free trial
+#    def admin_trial(self, chat):
+#        t = P.trial_settings(self.store)
+#        taken = self.store.one("SELECT count(*) c FROM users WHERE trial_at IS NOT NULL")["c"]
+#        self.say(chat, "🎁 تست رایگان\n\nوضعیت: %s\nحجم: %s\nمدت: %g ساعت\nسرعت: %s\n"
+#                       "تا حالا گرفته‌اند: %d نفر\n\nهر حساب تلگرام فقط یک بار می‌تواند "
+#                       "بگیرد، و فقط تا وقتی هیچ پلنی نگرفته باشد."
+#                 % ("روشن" if t["on"] else "خاموش",
+#                    ("%g گیگ" % t["gb"]) if t["gb"] else "نامحدود", t["hours"],
+#                    ("%g مگابیت بر ثانیه" % t["mbps"]) if t["mbps"] else "بی‌حد", taken), kb(
+#            [btn("📊 حجم", "a:trg"), btn("⏱ مدت", "a:trh"), btn("🚀 سرعت", "a:trs")],
+#            [btn("خاموش کردن" if t["on"] else "روشن کردن", "a:trx")]))
+#
 #    # payments
 #    def admin_payments(self, chat):
 #        card, holder = self.setting("card_number"), self.setting("card_holder")
@@ -10479,6 +10624,7 @@ exit 0
 #                 "آی‌پی ثبت‌شده: %d" % ips,
 #                 "مجموع مصرف: %s" % P.human(used),
 #                 "رسید در انتظار: %d" % pending,
+#                 "تست رایگان گرفته‌اند: %d" % store_trials(self.store),
 #                 "فروش ۳۰ روز اخیر: %d مورد، %s" % (sales["c"], P.toman(sales["a"])),
 #                 "", "🖥 سرورها:"]
 #        rows = s.q("SELECT m.* FROM metrics m JOIN (SELECT host, MAX(at) at FROM metrics"
