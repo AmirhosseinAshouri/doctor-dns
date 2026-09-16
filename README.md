@@ -518,6 +518,7 @@ sudo smartdns-bot off            # forget the token
 | | |
 |---|---|
 | **`/start`** | opens an account - pending, with nothing, like a web signup |
+| **🎁 تست رایگان** | one free 24-hour trial, once per Telegram account, offered until they buy anything |
 | **👤 حساب من** | status, plan, registered address, usage, allowance, speed, end date |
 | **🛒 خرید / تمدید** | pick a plan, then pay card to card (a photo of the receipt) or online through Zarinpal |
 | **🌐 ثبت آی‌پی** | a mini app that registers the address the phone is on, or type one in |
@@ -526,6 +527,14 @@ sudo smartdns-bot off            # forget the token
 The bot messages them on its own: at 80% and 95% of the allowance, when it
 runs out or the period ends, when a receipt is approved or rejected, and when
 the account is activated.
+
+**The free trial.** A new account is offered one trial - 1 GB for 24 hours by
+default - which turns the service on at once, so somebody can test it before
+paying. It is offered only while the account has never had anything: once the
+trial ends, or a plan is bought, it is not offered again. Taking it is recorded
+on the account, so it cannot be taken twice, and it shows in the bot's stats.
+Set its size, length and speed, or switch it off, in the bot, under
+**🛠 مدیریت → 🎁 تست رایگان**.
 
 Buying renews. The allowance becomes the plan's, usage starts from zero and the
 period counts from that day. A plan can carry a template, which the account is
@@ -541,6 +550,8 @@ Under **🛠 مدیریت**:
 - **Customers** - find one by name, id, Telegram id or address; set the
   allowance, days and speed, apply a plan, change template, reset usage, suspend.
 - **Plans** - create, edit, stop selling, delete.
+- **Free trial** - its size, length and speed, or switch it off; and how many
+  have taken one.
 - **Payment methods** - the card number and its holder, the Zarinpal merchant ID.
 - **Stats** - customers by status, receipts waiting, sales over 30 days, and each
   server's health.
@@ -611,9 +622,13 @@ reach the service from.
   a password, and nothing here asks for a password over plain HTTP — so it is
   not served at all rather than served unsafely. Nobody can sign up or
   register an address on such a relay until it is given a domain.
-- **There is no trial.** Signing up gets an account and somewhere to send a
-  receipt — no traffic. An account becomes able to connect when a plan is
-  bought in the Telegram bot, or when an operator gives it one.
+- **The web page has no trial.** Signing up there gets an account and
+  somewhere to send a receipt — no traffic — until a plan is bought or an
+  operator gives one. The free trial is offered in the Telegram bot only.
+- **The trial is one per Telegram account, not one per person.** Somebody who
+  opens a second Telegram account can take another. What limits that is the
+  address: an address registered to one account cannot be registered to
+  another, so a second trial is of no use on the same connection.
 - **Plans are sold only in the bot.** The web page takes a receipt but cannot
   pick a plan or pay online; an operator approving that receipt sets the
   allowance by hand.

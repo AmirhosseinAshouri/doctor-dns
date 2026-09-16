@@ -35,6 +35,12 @@ except Exception:
 HERE = os.path.dirname(os.path.abspath(__file__))
 fails = []
 
+# These tests talk to a server of their own on 127.0.0.1. A system-wide proxy -
+# macOS settings, or http_proxy in the environment - would have urllib send even
+# those requests to the proxy, which answers a local port it knows nothing about
+# with 503. Nothing here should ever leave the machine, so proxying is off.
+os.environ["no_proxy"] = os.environ["NO_PROXY"] = "*"
+
 
 def check(label, cond, detail=""):
     print(("  ok   " if cond else "  FAIL ") + label +
@@ -555,6 +561,88 @@ check("confirming queues one message per Telegram account",
       store.one("SELECT count(*) c FROM outbox")["c"] == queued + reach)
 press(ADMIN, "a:bcy")
 check("confirming twice sends nothing twice", store.one("SELECT count(*) c FROM outbox")["c"] == queued + reach)
+
+print("the free trial")
+TRIAL1, TRIAL2 = 5010, 5011
+t = panel.trial_settings(store)
+check("it is on by default, 1 GB for 24 hours", t["on"] and t["gb"] == 1 and t["hours"] == 24)
+update(TRIAL1, "/start")
+first = user_of(TRIAL1)
+check("a new account is offered it", panel.trial_reason(store, first) == "")
+check("and told so on its card", "تست رایگان" in b.account_text(first))
+update(TRIAL1, bot.MENU_BUY)
+check("the buy menu offers it first",
+      buttons(last(TRIAL1))[0]["callback_data"] == "trial", str(buttons(last(TRIAL1))))
+press(TRIAL1, "trial")
+first = user_of(TRIAL1)
+check("taking it turns the account on", first["status"] == "active")
+check("with the trial's allowance", first["quota_bytes"] == panel.GB)
+check("and no usage yet", first["used_bytes"] == 0)
+ends = panel.parse_ts(first["expires_at"])
+hours = (ends - datetime.now(timezone.utc)).total_seconds() / 3600 if ends else 0
+check("for 24 hours", 23.9 < hours <= 24, str(first["expires_at"]))
+check("it is stamped on the account", first["trial_at"] is not None)
+check("and recorded like a payment of nothing",
+      store.one("SELECT count(*) c FROM transactions WHERE kind = 'trial' AND user_id = ?",
+                (first["id"],))["c"] == 1)
+check("the customer is told what to do next", "ثبت آی‌پی" in last(TRIAL1).get("text", ""))
+press(TRIAL1, "trial")
+check("a second tap gets nothing", "قبلاً" in last(TRIAL1).get("text", ""))
+check("and no second trial is recorded",
+      store.one("SELECT count(*) c FROM transactions WHERE kind = 'trial' AND user_id = ?",
+                (first["id"],))["c"] == 1)
+update(TRIAL1, bot.MENU_BUY)
+check("nor is it offered again",
+      not any(x["callback_data"] == "trial" for x in buttons(last(TRIAL1))))
+store.run("UPDATE users SET expires_at = ? WHERE id = ?",
+          (bot.ago(hours=1), first["id"]))
+panel.enforce_quotas(store)
+check("when it runs out the account stops", user_of(TRIAL1)["status"] == "expired")
+check("and they are told to buy", any("تمام شد" in x for x in outbox(TRIAL1)))
+check("an account whose trial ended is not given another",
+      panel.trial_reason(store, user_of(TRIAL1)) != "")
+check("neither is one that bought a plan", panel.trial_reason(store, user_of(CUSTOMER)) != "")
+check("nor a web account with no Telegram", panel.trial_reason(store, store.one(
+    "SELECT * FROM users WHERE id = ?", (web["id"],))) != "")
+ok, why = panel.grant_trial(store, user_of(TRIAL1)["id"])
+check("and asking for one outright is refused", not ok and why)
+
+print("the operator sets the trial")
+press(ADMIN, "a:tr")
+check("its card shows the settings and how many took it", "تست رایگان" in last(ADMIN).get("text", "")
+      and "گرفته‌اند: 1" in last(ADMIN).get("text", ""))
+press(ADMIN, "a:trg")
+update(ADMIN, "۲٫۵")
+check("the size is set in Persian digits", store.setting("trial_gb") == "2.5")
+press(ADMIN, "a:trh")
+update(ADMIN, "48")
+check("so is the length", store.setting("trial_hours") == "48")
+press(ADMIN, "a:trs")
+update(ADMIN, "-1")
+check("a negative speed is refused", store.setting("trial_mbps") == "0")
+update(ADMIN, "3")
+check("a real one is saved", store.setting("trial_mbps") == "3")
+press(ADMIN, "a:trx")
+check("the trial can be switched off", not panel.trial_settings(store)["on"])
+update(TRIAL2, "/start")
+update(TRIAL2, bot.MENU_BUY)
+check("then nobody is offered it",
+      not any(x["callback_data"] == "trial" for x in buttons(last(TRIAL2))))
+press(TRIAL2, "trial")
+check("and taking one is refused", user_of(TRIAL2)["status"] == "pending")
+press(ADMIN, "a:trx")
+check("and it can be switched back on", panel.trial_settings(store)["on"])
+press(TRIAL2, "trial")
+second = user_of(TRIAL2)
+check("the operator's numbers are what a trial gives",
+      second["quota_bytes"] == int(2.5 * panel.GB) and second["speed_kbps"] == 3000)
+check("for the hours they set", (panel.parse_ts(second["expires_at"])
+                                 - datetime.now(timezone.utc)).total_seconds() > 47 * 3600)
+store.set_setting("trial_hours", "0")
+check("a length of zero switches it off too", panel.trial_reason(store, user_of(NEWBIE)) != "")
+store.set_setting("trial_hours", "24")
+store.set_setting("trial_gb", "1")
+store.set_setting("trial_mbps", "0")
 
 print("delivering the outbox")
 

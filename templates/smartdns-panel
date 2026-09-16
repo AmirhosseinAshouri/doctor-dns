@@ -300,6 +300,10 @@ MIGRATIONS = [
     # nor forwarded; code that creates work sets them to 0.
     ("transactions", "settled", "INTEGER NOT NULL DEFAULT 1"),
     ("transactions", "admin_notified", "INTEGER NOT NULL DEFAULT 1"),
+    # When this account took the one free trial it gets. Null is "never",
+    # which is what every account that predates the trial gets - so nobody
+    # is refused one because of when they signed up.
+    ("users", "trial_at", "TEXT"),
 ]
 
 # Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -338,10 +342,16 @@ MAX_RECEIPT = 4 * MB
 # rather than in this file, so changing either is an edit in the admin panel
 # rather than a redeploy to every machine.
 DEFAULT_SETTINGS = {
-    # No trial. A new account gets nothing until an operator gives it
-    # something - see create_web_user.
     "plan_bytes": str(2 * GB),
     "plan_days": "30",
+    # The free trial, offered in the bot to an account that has never had
+    # anything. One per Telegram account, recorded in users.trial_at. The
+    # operator sets these from the bot; "trial_on" empty switches it off, and
+    # so does a length of zero.
+    "trial_on": "1",
+    "trial_gb": "1",
+    "trial_hours": "24",
+    "trial_mbps": "0",
 }
 
 # Fractions of the quota at which the user is warned, and the bit each one
@@ -1323,6 +1333,78 @@ def telegram_init_data(token, raw, max_age=None):
     if age > (INIT_DATA_MAX_AGE if max_age is None else max_age) or age < -300:
         return None
     return user
+
+
+def trial_settings(store):
+    return {"on": store.setting("trial_on", "1") == "1",
+            "gb": float(store.setting("trial_gb", "1") or 0),
+            "hours": float(store.setting("trial_hours", "24") or 0),
+            "mbps": float(store.setting("trial_mbps", "0") or 0)}
+
+
+def trial_summary(store):
+    t = trial_settings(store)
+    parts = [("%g گیگ" % t["gb"]) if t["gb"] else "حجم نامحدود", "%g ساعت" % t["hours"]]
+    if t["mbps"]:
+        parts.append("%g مگابیت" % t["mbps"])
+    return " · ".join(parts)
+
+
+def trial_reason(store, user):
+    """Why this account cannot take the free trial, or "" if it can.
+
+    A reason rather than a yes or no, because every caller wants to say what
+    the matter is. Only an account that has never had anything is offered one:
+    a customer whose plan has run out is asked to buy, not given another
+    trial.
+    """
+    t = trial_settings(store)
+    if not t["on"] or t["hours"] <= 0:
+        return "تست رایگان الان فعال نیست"
+    if not user["telegram_id"]:
+        return "تست رایگان فقط از داخل ربات تلگرام گرفته می‌شود"
+    if user["trial_at"]:
+        return "تست رایگان این حساب قبلاً گرفته شده"
+    if user["status"] == "suspended":
+        return "این حساب مسدود است"
+    if user["status"] != "pending":
+        return "تست رایگان فقط برای حسابی است که هنوز پلنی نداشته"
+    return ""
+
+
+def grant_trial(store, user_id):
+    """Hand out the one free trial an account gets: (ok, why not).
+
+    One statement does the giving and the recording, and only while trial_at is
+    still null, so two taps a moment apart cannot take two trials - the second
+    changes no rows and is told so.
+    """
+    user = store.one("SELECT * FROM users WHERE id = ?", (user_id,))
+    if not user:
+        return False, "حساب پیدا نشد"
+    reason = trial_reason(store, user)
+    if reason:
+        return False, reason
+    t = trial_settings(store)
+    ends = (datetime.now(timezone.utc) + timedelta(hours=t["hours"])).isoformat(
+        timespec="seconds")
+    stamp = now()
+    changed = store.run(
+        "UPDATE users SET quota_bytes = ?, used_bytes = 0, warned = 0, speed_kbps = ?,"
+        " quota_mode = 'oneoff', quota_reset_at = NULL, expires_at = ?,"
+        " status = 'active', trial_at = ?"
+        " WHERE id = ? AND trial_at IS NULL AND status = 'pending'",
+        (int(t["gb"] * GB), int(t["mbps"] * 1000), ends, stamp, user_id)).rowcount
+    if changed != 1:
+        return False, "تست رایگان این حساب قبلاً گرفته شده"
+    # Recorded like a payment of nothing, so the trials show up beside the
+    # sales rather than only as a date on the account.
+    store.run(
+        "INSERT INTO transactions (user_id, amount, kind, status, note, created_at,"
+        " decided_at) VALUES (?, 0, 'trial', 'approved', 'trial', ?, ?)",
+        (user_id, stamp, stamp))
+    print("trial: user %d, %s until %s" % (user_id, trial_summary(store), ends), flush=True)
+    return True, ""
 
 
 def apply_plan(store, user_id, plan):
