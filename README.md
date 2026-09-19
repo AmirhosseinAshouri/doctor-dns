@@ -523,6 +523,7 @@ sudo smartdns-bot off            # forget the token
 | **🛒 خرید / تمدید** | pick a plan, then pay card to card (a photo of the receipt) or online through Zarinpal |
 | **🌐 ثبت آی‌پی** | a mini app that registers the address the phone is on, or type one in |
 | **📡 آدرس DNS** | the address to put in a console, phone or router |
+| **📶 پینگ بازی‌ها** | each game's ping from the Iranian server right now - green, yellow or red, fastest first |
 
 The bot messages them on its own: at 80% and 95% of the allowance, when it
 runs out or the period ends, when a receipt is approved or rejected, and when
@@ -540,6 +541,16 @@ Buying renews. The allowance becomes the plan's, usage starts from zero and the
 period counts from that day. A plan can carry a template, which the account is
 moved to.
 
+**Game pings.** Every five minutes the relay times a connection to a few of
+each game's domains - the same ones its DNS list routes - and the bot shows the
+result: customers see one line per game, the admin sees every host, its
+address and its loss, and which relay measured. It is the Iranian server's
+ping, not the customer's: a game's match traffic goes straight from their own
+internet to the game, not through the relay. It is still the best guide to
+which games answer well from Iran, and which Iran filters outright. TCP
+connections are timed rather than ICMP pings, because many game servers ignore
+ping; names are looked up at public resolvers, not the relay's own DNS.
+
 ### What the operator can do
 
 Under **🛠 مدیریت**:
@@ -555,6 +566,8 @@ Under **🛠 مدیریت**:
 - **Payment methods** - the card number and its holder, the Zarinpal merchant ID.
 - **Stats** - customers by status, receipts waiting, sales over 30 days, and each
   server's health.
+- **Pings** - each game's hosts as the relay last measured them: address, time,
+  loss, and which Iran filters.
 - **Broadcast** - one message to everybody who has started the bot, after a
   preview.
 
