@@ -49,6 +49,11 @@ elif [ -f "$ETC/panel.env" ]; then
     role=exit
     status="smartdns-panel smartdns-admin smartdns-bot nginx smartdns-cert.timer"
     logs="smartdns-panel smartdns-admin smartdns-bot nginx smartdns-cert"
+elif [ -f "$ETC/exit.env" ]; then
+    # An extra exit: nginx carrying traffic, and nothing else of ours.
+    role=extra
+    status="nginx"
+    logs="nginx"
 else
     echo "doctor dns is not installed on this machine" >&2
     exit 1

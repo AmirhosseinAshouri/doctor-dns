@@ -104,6 +104,7 @@ install_payload() {
               -e "s#__EXIT_HTTPS__#${EXIT_HTTPS:-__EXIT_HTTPS__}#g" \
               -e "s#__EXIT_HTTP__#${EXIT_HTTP:-__EXIT_HTTP__}#g" \
               -e "${NO_TUNNEL:+/# tunnel begin/,/# tunnel end/d}" \
+              -e "${RELAY_ALLOW:+s#allow ${RELAY_IP};#${RELAY_ALLOW}#g}" \
         > "$tmp"
     [ -s "$tmp" ] || die "payload $name is empty - is this file complete?"
     # Whether this file was ours or already here decides what uninstall does
@@ -755,6 +756,7 @@ if [ -n "$INSTALLED_VERSION" ]; then
     if [ -z "$ROLE" ]; then
         if [ -f /etc/smart-dns/sync.env ]; then ROLE=relay
         elif [ -f /etc/smart-dns/panel.env ]; then ROLE=exit
+        elif [ -f /etc/smart-dns/exit.env ]; then ROLE=extra
         fi
     fi
     if [ "$ROLE" = relay ]; then
@@ -769,6 +771,11 @@ if [ -n "$INSTALLED_VERSION" ]; then
         # panel.env holds every relay this exit serves, comma separated. Any of
         # them will do here: it is already on the list, so nothing is added.
         [ -n "$PEER_IP" ] || PEER_IP="$(sed -n 's/^RELAY_IP=//p' /etc/smart-dns/panel.env 2>/dev/null | head -1 | cut -d, -f1 || true)"
+    elif [ "$ROLE" = extra ]; then
+        # Every relay this exit carries for, comma separated, and its own
+        # address - kept in exit.env, since the state file records only one.
+        [ -n "$PEER_IP" ] || PEER_IP="$(sed -n 's/^RELAY_IP=//p' /etc/smart-dns/exit.env 2>/dev/null | head -1 || true)"
+        [ -n "$SELF_IP" ] || SELF_IP="$(sed -n 's/^SELF_IP=//p' /etc/smart-dns/exit.env 2>/dev/null | head -1 || true)"
     fi
     PANEL_DOMAIN="${PANEL_DOMAIN:-$(was panel-domain)}"
     info "upgrading this ${ROLE:-machine} in place - nothing to answer"
@@ -786,28 +793,46 @@ ROLE="${ROLE:-}"; PEER_IP="${PEER_IP:-}"; SELF_IP="${SELF_IP:-}"
 
 if [ -z "$ROLE" ]; then
     printf '\n%sWhich side is this machine?%s\n\n' "$B" "$N"
-    printf '  1) relay  - the server inside Iran, the one clients point their DNS at\n'
-    printf '  2) exit   - the server abroad, which reaches the blocked sites\n\n'
+    printf '  1) relay       - the server inside Iran, the one clients point their DNS at\n'
+    printf '  2) exit        - the server abroad, which reaches the blocked sites, and\n'
+    printf '                   keeps the database, the admin panel and the bot\n'
+    printf '  3) extra exit  - another server abroad that only carries traffic; add it\n'
+    printf '                   in the bot afterwards and customers can choose it\n\n'
     while :; do
-        read -r -p "  choice [1/2]: " answer
+        read -r -p "  choice [1/2/3]: " answer
         case "$answer" in
             1|relay) ROLE=relay; break ;;
             2|exit)  ROLE=exit;  break ;;
-            *) warn "answer 1 or 2" ;;
+            3|extra) ROLE=extra; break ;;
+            *) warn "answer 1, 2 or 3" ;;
         esac
     done
 fi
-[ "$ROLE" = relay ] || [ "$ROLE" = exit ] || die "ROLE must be relay or exit"
+case "$ROLE" in relay|exit|extra) ;; *) die "ROLE must be relay, exit or extra" ;; esac
 
 if [ -z "$PEER_IP" ]; then
     printf '\n'
     if [ "$ROLE" = relay ]; then
         read -r -p "  public address of the EXIT server abroad: " PEER_IP
+    elif [ "$ROLE" = extra ]; then
+        read -r -p "  public address of the RELAY server in Iran (several: comma separated): " PEER_IP
     else
         read -r -p "  public address of the RELAY server in Iran: " PEER_IP
     fi
 fi
-valid_ip "$PEER_IP" || die "'$PEER_IP' is not an IPv4 address"
+RELAY_ALLOW=""
+if [ "$ROLE" = extra ]; then
+    # An extra exit may carry traffic for several relays. Every one of them is
+    # let in, and nobody else, so it is not an open proxy either.
+    PEER_IP="$(printf '%s' "$PEER_IP" | tr -d ' ')"
+    for ip in $(printf '%s' "$PEER_IP" | tr ',' ' '); do
+        valid_ip "$ip" || die "'$ip' is not an IPv4 address"
+        RELAY_ALLOW="${RELAY_ALLOW:+$RELAY_ALLOW }allow $ip;"
+    done
+    [ -n "$RELAY_ALLOW" ] || die "an extra exit needs the address of at least one relay"
+else
+    valid_ip "$PEER_IP" || die "'$PEER_IP' is not an IPv4 address"
+fi
 
 if [ -z "$SELF_IP" ]; then
     guess="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
@@ -821,7 +846,7 @@ valid_ip "$SELF_IP" || die "'$SELF_IP' is not an IPv4 address"
 if [ "$ROLE" = relay ]; then
     RELAY_IP="$SELF_IP"; EXIT_IP="$PEER_IP"
 else
-    RELAY_IP="$PEER_IP"; EXIT_IP="$SELF_IP"
+    RELAY_IP="${PEER_IP%%,*}"; EXIT_IP="$SELF_IP"
 fi
 
 # ------------------------------------------------------------------ panel
@@ -843,7 +868,8 @@ fi
 # Optional, like the panel. Without it the claim link is plain http, which
 # works but sends the registration token in the clear - anyone on the path can
 # take it and register their own address against the user's account.
-if [ -z "${PANEL_DOMAIN:-}" ] && [ -z "${ASSUME_YES:-}" ] && [ -z "$UPGRADE" ]; then
+if [ -z "${PANEL_DOMAIN:-}" ] && [ -z "${ASSUME_YES:-}" ] && [ -z "$UPGRADE" ] \
+   && [ "$ROLE" != extra ]; then
     printf '\n%sHTTPS%s (optional - press enter to skip)\n\n' "$B" "$N"
     if [ "$ROLE" = relay ]; then
         printf '  A name pointing at this machine, for the page users open to\n'
@@ -875,7 +901,8 @@ env_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1 || true; }
 # --tunnel: ask again on a machine that is already set up. The exit shows the
 # menu with what it has now as the defaults; the relay asks for the exit's new
 # pairing token, which carries the answer.
-if [ -n "${ASK_TUNNEL:-}" ] && [ -z "$TUNNEL" ]; then
+# An extra exit has no tunnel: that runs between a relay and its main exit.
+if [ -n "${ASK_TUNNEL:-}" ] && [ -z "$TUNNEL" ] && [ "$ROLE" != extra ]; then
     if [ "$ROLE" = exit ]; then
         CUR_TUNNEL="$(env_get /etc/smart-dns/panel.env TUNNEL)"
         CUR_TRANSPORT="$(env_get /etc/smart-dns/panel.env TUNNEL_TRANSPORT)"
@@ -1131,7 +1158,7 @@ info "stream module: $MOD"
 # that can be told to ask for AAAA records only, which nginx has from 1.23.1 -
 # older, or without IPv6, the block is left out and nothing changes.
 NO_GOOGLE_V6=1
-if [ "$ROLE" = exit ]; then
+if [ "$ROLE" != relay ]; then
     ngv="$(nginx -v 2>&1 | sed -n 's#.*nginx/\([0-9.]*\).*#\1#p')"
     if [ "$(printf '%s\n%s\n' 1.23.1 "${ngv:-0}" | sort -V | head -1)" = 1.23.1 ] \
        && curl -6 -s -o /dev/null -m 10 https://www.google.com/ 2>/dev/null; then
@@ -1154,6 +1181,17 @@ else
     NO_TUNNEL=1; EXIT_HTTPS="$EXIT_IP:443"; EXIT_HTTP="$EXIT_IP:80"
 fi
 if [ "$ROLE" = relay ]; then
+    # The map of which exit each customer leaves by, which nginx.conf includes.
+    # smartdns-sync keeps it from here on. Written now with only the default,
+    # so nginx has something to load, and again whenever the default itself
+    # changes - a tunnel switched on or off - which the sync then fills back in
+    # within a minute.
+    note_file /etc/nginx/smartdns-exits.conf
+    if ! grep -qsF "default ${EXIT_HTTPS};" /etc/nginx/smartdns-exits.conf; then
+        printf '# written by the installer; smartdns-sync keeps it from here\nmap $remote_addr $smartdns_exit_https {\n    default %s;\n}\nmap $remote_addr $smartdns_exit_http {\n    default %s;\n}\n' \
+            "$EXIT_HTTPS" "$EXIT_HTTP" > /etc/nginx/smartdns-exits.conf
+        NGINX_CHANGED=1
+    fi
     install_payload RELAY_NGINX /etc/nginx/nginx.conf && NGINX_CHANGED=1 || true
 else
     install_payload EXIT_NGINX /etc/nginx/nginx.conf && NGINX_CHANGED=1 || true
@@ -1629,6 +1667,21 @@ fi
 # on every run meant an upgrade run without it skipped this whole section and
 # silently left the old agent in place - the machine kept syncing, so nothing
 # looked wrong, while the new code never arrived.
+# ------------------------------------------------------------- extra exit
+# A server that carries traffic and nothing else: no database, no admin
+# panel, no bot - the main exit keeps those, and learns of this one when it is
+# added in the bot. What is kept here is only what a re-run needs to know what
+# this machine is, and which relays it lets in.
+if [ "$ROLE" = extra ]; then
+    step "Extra exit"
+    mkdir -p /etc/smart-dns; chmod 700 /etc/smart-dns
+    note_file /etc/smart-dns/exit.env
+    umask 077
+    printf 'RELAY_IP=%s\nSELF_IP=%s\n' "$PEER_IP" "$SELF_IP" > /etc/smart-dns/exit.env
+    umask 022
+    info "carries traffic for $PEER_IP and nobody else"
+fi
+
 if [ "$ROLE" = relay ] && [ -z "${SYNC_TOKEN:-}" ] && [ -f /etc/smart-dns/sync.env ]; then
     SYNC_TOKEN="$(sed -n 's/^SYNC_SECRET=//p' /etc/smart-dns/sync.env | head -1 || true).$(sed -n 's/^SYNC_FINGERPRINT=//p' /etc/smart-dns/sync.env | head -1 || true)"
     PANEL_IP="${PANEL_IP:-$(sed -n 's/^PANEL_HOST=//p' /etc/smart-dns/sync.env | head -1 || true)}"
@@ -1686,6 +1739,9 @@ EOF
         set_env_key /etc/smart-dns/sync.env PANEL_DOMAIN "${PANEL_DOMAIN:-}"
     fi
     set_env_key /etc/smart-dns/sync.env TUNNEL "$TUNNEL"
+    # The exit every customer leaves by unless they are on an extra one, and
+    # the backup for all of those.
+    set_env_key /etc/smart-dns/sync.env EXIT_IP "$EXIT_IP"
     set_env_key /etc/smart-dns/sync.env TUNNEL_TRANSPORT "${TUNNEL_TRANSPORT:-}"
     set_env_key /etc/smart-dns/sync.env TUNNEL_DIRECTION "${TUNNEL_DIRECTION:-}"
     set_env_key /etc/smart-dns/sync.env TUNNEL_PORT "${TUNNEL_PORT:-}"
@@ -1848,6 +1904,18 @@ if [ "$ROLE" = relay ]; then
     Manage the list with:  smartdns status | list | add | del | bypass
 
 ' "$RELAY_IP"
+elif [ "$ROLE" = extra ]; then
+    printf '
+    This extra exit carries traffic for %s and accepts nothing else.
+    Add it in the Telegram bot, under 🛠 مدیریت -> 🌍 خروجی‌ها -> ➕:
+
+        a name | %s
+
+    Customers can then choose it, or be put on it automatically whenever it
+    has the lowest ping from their relay. Upgrade the relay to this version
+    first, if you have not - it needs to know its own exit to fall back to.
+
+' "$PEER_IP" "$SELF_IP"
 else
     printf '
     This exit only accepts connections from %s, so it is not an open proxy.
@@ -2279,11 +2347,20 @@ exit 0
 #    }
 #    # tunnel end
 #
+#    # Which exit each customer's connections leave by. The installer writes
+#    # it with nothing but the default - the exit above - and smartdns-sync
+#    # rewrites it from the exits the panel lists and the one each customer is
+#    # on: a map on their address, and one upstream per extra exit with this
+#    # relay's own exit as its backup. An address not in it takes the default,
+#    # which is everybody until the first sync, and everybody on a relay with
+#    # one exit. A file of its own, so rewriting it never touches this one.
+#    include /etc/nginx/smartdns-exits.conf;
+#
 #    server {
 #        listen 443;
 #        proxy_connect_timeout 10s;
 #        proxy_timeout 10m;
-#        proxy_pass __EXIT_HTTPS__;
+#        proxy_pass $smartdns_exit_https;
 #    }
 #
 #    # Port 80 is forwarded rather than answered. It used to return a 301 to
@@ -2295,7 +2372,7 @@ exit 0
 #        listen 80;
 #        proxy_connect_timeout 10s;
 #        proxy_timeout 10m;
-#        proxy_pass __EXIT_HTTP__;
+#        proxy_pass $smartdns_exit_http;
 #    }
 #}
 #__END_RELAY_NGINX__
@@ -3506,6 +3583,18 @@ exit 0
 #    attempts   INTEGER NOT NULL DEFAULT 0
 #);
 #CREATE INDEX IF NOT EXISTS outbox_unsent ON outbox(sent_at, id);
+#
+#-- Extra exits: servers abroad, installed as "extra exit", that carry traffic
+#-- and nothing else - no database, no bot. The main exit is not a row: it is
+#-- whichever one each relay was installed with, id 0 wherever an exit is named.
+#-- A customer picks one in the bot, or is put on the one with the lowest ping.
+#CREATE TABLE IF NOT EXISTS exits (
+#    id         INTEGER PRIMARY KEY,
+#    name       TEXT NOT NULL,
+#    ip         TEXT NOT NULL UNIQUE,
+#    active     INTEGER NOT NULL DEFAULT 1,
+#    created_at TEXT NOT NULL
+#);
 #"""
 #
 #METRIC_FIELDS = ("cpu", "load", "mem_used", "mem_total", "swap_used",
@@ -3554,6 +3643,10 @@ exit 0
 #    # which is what every account that predates the trial gets - so nobody
 #    # is refused one because of when they signed up.
 #    ("users", "trial_at", "TEXT"),
+#    # Which exit this account's traffic leaves by: null is automatic - the
+#    # one with the lowest ping from the relay - 0 the main exit, and anything
+#    # else an extra exit's id.
+#    ("users", "exit_id", "INTEGER"),
 #]
 #
 ## Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -4076,6 +4169,27 @@ exit 0
 #        every = relay_pings(self)
 #        every[relay] = {"at": now(), "games": games}
 #        self.set_setting("relay_pings", json.dumps(every, ensure_ascii=False))
+#
+#    def active_exits(self):
+#        return self.q("SELECT * FROM exits WHERE active = 1 ORDER BY id")
+#
+#    def note_exit_pings(self, relay, pings):
+#        """Keep how fast each exit answered one relay, the latest round only."""
+#        if not isinstance(pings, dict) or not pings:
+#            return
+#        clean = {}
+#        for eid, p in list(pings.items())[:64]:
+#            if not (isinstance(eid, str) and eid.isdigit() and isinstance(p, dict)):
+#                continue
+#            ms, loss = p.get("ms"), p.get("loss")
+#            clean[eid] = {
+#                "ms": float(ms) if isinstance(ms, (int, float)) and 0 <= ms < 60000 else None,
+#                "loss": float(loss) if isinstance(loss, (int, float)) and 0 <= loss <= 1 else 1.0}
+#        if not clean:
+#            return
+#        every = exit_pings(self)
+#        every[relay] = {"at": now(), "exits": clean}
+#        self.set_setting("relay_exit_pings", json.dumps(every))
 #
 #    def note_relay(self, panel, dns):
 #        """Remember where a relay's customer pages are, and its DNS address.
@@ -4659,6 +4773,56 @@ exit 0
 #    return every if isinstance(every, dict) else {}
 #
 #
+## ------------------------------------------------------------------ exits
+#def main_exit_name(store):
+#    return store.setting("main_exit_name", "") or "سرور اصلی"
+#
+#
+#def exit_pings(store):
+#    """{relay: {"at", "exits": {id: {"ms", "loss"}}}}, the latest from each."""
+#    try:
+#        every = json.loads(store.setting("relay_exit_pings", "") or "{}")
+#    except ValueError:
+#        return {}
+#    return every if isinstance(every, dict) else {}
+#
+#
+#def fresh_exit_pings(store, relay=None):
+#    """{exit id: fastest ms} from recent rounds - one relay's, or the best of all.
+#
+#    A round older than PING_STALE_MINUTES says nothing about now, and choosing
+#    an exit on it could put everybody on one that has since gone quiet."""
+#    stamp = datetime.now(timezone.utc)
+#    out = {}
+#    for r, entry in exit_pings(store).items():
+#        if (relay is not None and r != relay) or not isinstance(entry, dict):
+#            continue
+#        seen = parse_ts(entry.get("at"))
+#        if not seen or (stamp - seen).total_seconds() > PING_STALE_MINUTES * 60:
+#            continue
+#        for eid, p in (entry.get("exits") or {}).items():
+#            ms = p.get("ms") if isinstance(p, dict) else None
+#            if isinstance(ms, (int, float)) and (eid not in out or ms < out[eid]):
+#                out[eid] = ms
+#    return out
+#
+#
+#def resolve_exit(choice, measured, active):
+#    """The exit an account's traffic takes, as its id in text - "0" the main.
+#
+#    The account's own choice while that exit is active. Otherwise - automatic,
+#    or a choice that has since been switched off - the fastest exit measured,
+#    and the main exit when nothing has been."""
+#    if choice is not None and (choice == 0 or str(choice) in active):
+#        return str(choice)
+#    best, best_ms = "0", None
+#    for eid in ["0"] + sorted(active, key=int):
+#        ms = measured.get(eid)
+#        if isinstance(ms, (int, float)) and (best_ms is None or ms < best_ms):
+#            best, best_ms = eid, ms
+#    return best
+#
+#
 #def trial_settings(store):
 #    return {"on": store.setting("trial_on", "1") == "1",
 #            "gb": float(store.setting("trial_gb", "1") or 0),
@@ -5106,6 +5270,7 @@ exit 0
 #            self.store.record_metrics(self.client_address[0], body.get("host") or {})
 #            self.store.note_relay(body.get("panel"), body.get("dns"))
 #            self.store.note_pings(self.client_address[0], body.get("pings"))
+#            self.store.note_exit_pings(self.client_address[0], body.get("exit_pings"))
 #            # Quotas are evaluated here, on fresh numbers, so a user who runs
 #            # out is off the list this relay is about to be handed.
 #            try:
@@ -5124,12 +5289,25 @@ exit 0
 #                        "kbps": v["kbps"], "user": v.get("user", ""),
 #                        "profile": str(v["tid"]) if str(v["tid"]) in profiles else ""}
 #                       for ip, v in sorted(by_ip.items())]
+#            # Which exit each address leaves by, from this relay: the
+#            # account's own choice, or the fastest this relay measured. The
+#            # relay turns it into an nginx map. With no extra exits nothing is
+#            # sent, and every address takes the relay's own exit.
+#            exits = {str(r["id"]): {"name": r["name"], "ip": r["ip"]}
+#                     for r in self.store.active_exits()}
+#            if exits:
+#                measured = fresh_exit_pings(self.store, self.client_address[0])
+#                choices = {r["id"]: r["exit_id"] for r in self.store.q(
+#                    "SELECT id, exit_id FROM users WHERE status = 'active'")}
+#                for a in allowed:
+#                    a["exit"] = resolve_exit(choices.get(a["uid"]), measured, exits)
 #            extra = [r["domain"] for r in self.store.q(
 #                "SELECT domain FROM custom_domains ORDER BY domain")]
 #            return self.reply(200, {"allowed": allowed, "profiles": profiles,
 #                                    "extra_domains": extra,
 #                                    "templates": self.store.template_names(),
 #                                    "ping_targets": ping_targets(CATALOGUE),
+#                                    "exits": exits,
 #                                    })
 #
 #        # ---- user panel, served by the relay on the customer's behalf ----
@@ -6491,17 +6669,170 @@ exit 0
 #    while True:
 #        with PING_LOCK:
 #            targets = dict(PING_TARGETS)
-#        if not targets:
+#            exits = dict(EXIT_TARGETS)
+#            ready = SYNCED[0]
+#        if not ready:
 #            time.sleep(10)          # the first sync has not said what yet
 #            continue
 #        try:
-#            result = ping_round(targets)
+#            result = ping_round(targets) if targets else {}
 #            with PING_LOCK:
 #                PINGS.clear()
 #                PINGS.update(result)
 #        except Exception as e:
 #            log(WARN, "game pings failed: %s" % e)
+#        try:
+#            measured = ping_exits(exits)
+#            with PING_LOCK:
+#                EXIT_PINGS.clear()
+#                EXIT_PINGS.update(measured)
+#        except Exception as e:
+#            log(WARN, "exit pings failed: %s" % e)
 #        time.sleep(PING_EVERY)
+#
+#
+## ------------------------------------------------------------------ exits
+## Several exits: the one this relay was installed with - "0" everywhere, the
+## default, and the backup for every other - and any extra ones the panel lists,
+## servers abroad that carry traffic and nothing else. nginx sends each
+## customer's connections to their exit by a map on their address, kept in a
+## file of its own so that rewriting it never touches nginx.conf.
+#EXITS_CONF = "/etc/nginx/smartdns-exits.conf"
+#EXIT_TARGETS = {}       # id -> {"name", "ip"}: the extra exits, from the panel
+#EXIT_PINGS = {}         # the last round's exit pings, until the next sync
+#SYNCED = [False]        # whether the panel has answered once, since start
+#
+#
+#def clean_exits(exits):
+#    """The panel's list of extra exits, keeping only what nginx can be given."""
+#    out = {}
+#    if not isinstance(exits, dict):
+#        return out
+#    for eid, e in exits.items():
+#        if not (isinstance(eid, str) and eid.isdigit() and eid != "0" and isinstance(e, dict)):
+#            continue
+#        try:
+#            if not ipaddress.IPv4Address(e.get("ip")).is_global:
+#                continue
+#        except (ValueError, TypeError):
+#            continue
+#        out[eid] = {"name": str(e.get("name") or eid)[:40], "ip": str(e["ip"])}
+#    return out
+#
+#
+#def note_exit_targets(exits):
+#    clean = clean_exits(exits)
+#    with PING_LOCK:
+#        EXIT_TARGETS.clear()
+#        EXIT_TARGETS.update(clean)
+#        SYNCED[0] = True
+#    return clean
+#
+#
+#def take_exit_pings():
+#    with PING_LOCK:
+#        out = dict(EXIT_PINGS)
+#        EXIT_PINGS.clear()
+#    return out
+#
+#
+#def ping_exits(exits):
+#    """Time a connection from here to every exit: {id: {"ms", "loss"}}.
+#
+#    The leg this relay adds to every customer connection, so it is the number
+#    that decides which exit is fastest. An exit's nginx lets this relay in and
+#    nobody else, so the handshake answers."""
+#    jobs = {}
+#    if (CFG or {}).get("EXIT_IP"):
+#        jobs["0"] = CFG["EXIT_IP"]
+#    jobs.update({eid: e["ip"] for eid, e in exits.items()})
+#    out = {}
+#    if not jobs:
+#        return out
+#    keys = list(jobs)
+#    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+#        for eid, (ms, loss) in zip(keys, pool.map(time_host, [jobs[k] for k in keys])):
+#            out[eid] = {"ms": ms, "loss": loss}
+#    return out
+#
+#
+#def default_exit():
+#    """(https, http) targets for everybody not on an extra exit: the tunnel's
+#    upstreams when there is one - they fall back to the exit by themselves -
+#    and the exit's own address when there is not."""
+#    if (CFG or {}).get("TUNNEL") == "backpack":
+#        return "to_exit_https", "to_exit_http"
+#    ip = (CFG or {}).get("EXIT_IP", "")
+#    return "%s:443" % ip, "%s:80" % ip
+#
+#
+#def exits_conf(exits, assignment):
+#    """The nginx include: a map per protocol, and an upstream per extra exit
+#    that falls back to this relay's own exit when it does not answer."""
+#    https, http = default_exit()
+#    main = (CFG or {}).get("EXIT_IP", "")
+#    lines = ["# written by smartdns-sync whenever it changes - edits here are lost", ""]
+#    for proto, default in (("https", https), ("http", http)):
+#        lines.append("map $remote_addr $smartdns_exit_%s {" % proto)
+#        lines.append("    default %s;" % default)
+#        for ip, eid in sorted(assignment.items()):
+#            if eid in exits:
+#                lines.append("    %s exit_%s_%s;" % (ip, eid, proto))
+#        lines.append("}")
+#    for eid in sorted(exits, key=int):
+#        for proto, port in (("https", 443), ("http", 80)):
+#            lines.append("upstream exit_%s_%s {" % (eid, proto))
+#            lines.append("    server %s:%d;" % (exits[eid]["ip"], port))
+#            if main and main != exits[eid]["ip"]:
+#                lines.append("    server %s:%d backup;" % (main, port))
+#            lines.append("}")
+#    return "\n".join(lines) + "\n"
+#
+#
+#def _write_exits(text):
+#    tmp = EXITS_CONF + ".tmp"
+#    with open(tmp, "w") as fh:
+#        fh.write(text)
+#    os.replace(tmp, EXITS_CONF)
+#
+#
+#def apply_exits(exits, assignment):
+#    """Point each address at its exit: rewrite the map and reload nginx - only
+#    when it has changed, and only if nginx accepts it."""
+#    if not (CFG or {}).get("EXIT_IP"):
+#        # Installed by a version from before several exits; the next run of
+#        # the installer on this relay records its exit, and this starts then.
+#        return False
+#    chosen = {}
+#    for ip, eid in assignment.items():
+#        try:
+#            ipaddress.IPv4Address(ip)
+#        except (ValueError, TypeError):
+#            continue
+#        if eid in exits:
+#            chosen[ip] = eid
+#    want = exits_conf(exits, chosen)
+#    try:
+#        with open(EXITS_CONF) as fh:
+#            have = fh.read()
+#    except OSError:
+#        have = None
+#    if want == have:
+#        return False
+#    _write_exits(want)
+#    test = sh("nginx", "-t")
+#    if test.returncode != 0:
+#        if have is not None:
+#            _write_exits(have)
+#        log(ERROR, "exits: nginx refused the new map, so the old one stays:\n%s"
+#            % (test.stderr or "").strip()[-400:])
+#        return False
+#    r = sh("systemctl", "reload", "nginx")
+#    if r.returncode != 0:
+#        log(ERROR, "exits: nginx did not reload: %s" % (r.stderr or "").strip()[-200:])
+#        return False
+#    log(INFO, "exits: %d extra, %d addresses on one of them" % (len(exits), len(chosen)))
+#    return True
 #
 #
 #def sync_once():
@@ -6524,8 +6855,12 @@ exit 0
 #    pings = take_pings()
 #    if pings:
 #        report["pings"] = pings
+#    exit_pings = take_exit_pings()
+#    if exit_pings:
+#        report["exit_pings"] = exit_pings
 #    answer = post("/sync", report)
 #    note_ping_targets(answer.get("ping_targets"))
+#    exits = note_exit_targets(answer.get("exits"))
 #    try:
 #        save_template_names(answer.get("templates"))
 #    except Exception as e:
@@ -6555,6 +6890,15 @@ exit 0
 #        apply_speeds(answer.get("allowed") or [])
 #    except Exception as e:
 #        log_exception("speeds failed: %s" % e)
+#
+#    # Which exit each address leaves by - before the allowlist, as the
+#    # resolvers and speeds are, so a new address is pointed at its exit no
+#    # later than the moment it is let in.
+#    try:
+#        apply_exits(exits, {a["ip"]: str(a.get("exit") or "")
+#                            for a in answer.get("allowed") or [] if a.get("ip")})
+#    except Exception as e:
+#        log_exception("exits failed: %s" % e)
 #
 #    for ip in sorted(want - have):
 #        r = acl("add", ip, names[ip]) if names[ip] else acl("add", ip)
@@ -9893,11 +10237,12 @@ exit 0
 #MENU_DNS = "📡 آدرس DNS"
 #MENU_HELP = "❓ راهنما"
 #MENU_PING = "📶 پینگ بازی‌ها"
+#MENU_EXIT = "🌍 سرور خروجی"
 #MENU_ADMIN = "🛠 مدیریت"
 #MENU_CANCEL = "انصراف"
 #MENU_ACTIONS = {MENU_ACCOUNT: "account", MENU_BUY: "buy", MENU_IP: "ip",
 #                MENU_DNS: "dns", MENU_HELP: "help", MENU_ADMIN: "admin_home",
-#                MENU_PING: "pings"}
+#                MENU_PING: "pings", MENU_EXIT: "exits"}
 #
 #STATUS = {"active": "✅ فعال", "pending": "⏳ در انتظار خرید پلن",
 #          "over_quota": "⛔️ حجم تمام شده", "expired": "⌛️ دوره تمام شده",
@@ -9972,6 +10317,23 @@ exit 0
 #        return None, "قیمت باید عدد صحیح و دست‌کم ۱٬۰۰۰ تومان باشد."
 #    return {"name": name, "quota_gb": gb, "days": int(days),
 #            "speed_mbps": mbps, "price": int(price)}, ""
+#
+#
+#EXIT_FORMAT = ("نام و آی‌پی سرور خروجی را این‌طور بفرستید:\n"
+#               "آلمان ۲ | 203.0.113.10\n\n"
+#               "اول روی آن سرور doctor-dns.sh را اجرا کنید، گزینهٔ «3) extra exit» را بزنید "
+#               "و آی‌پی رله را بدهید.")
+#
+#
+#def ms_text(ms):
+#    return ("%d ms" % round(ms)) if isinstance(ms, (int, float)) else "اندازه‌گیری نشده"
+#
+#
+#def exit_label(name, ms):
+#    if not isinstance(ms, (int, float)):
+#        return "⚫ %s — اندازه‌گیری نشده" % name
+#    dot = "🟢" if ms < 80 else ("🟡" if ms < 150 else "🔴")
+#    return "%s %s — %d ms" % (dot, name, round(ms))
 #
 #
 #def game_ping(game):
@@ -10095,6 +10457,9 @@ exit 0
 #
 #    def menu(self, chat):
 #        rows = [[MENU_ACCOUNT, MENU_BUY], [MENU_IP, MENU_DNS], [MENU_PING, MENU_HELP]]
+#        # Only when there is a choice to make: one exit is no choice.
+#        if self.store.active_exits():
+#            rows.insert(2, [MENU_EXIT])
 #        if self.is_admin(chat):
 #            rows.append([MENU_ADMIN])
 #        return {"keyboard": [[{"text": t} for t in r] for r in rows],
@@ -10193,6 +10558,8 @@ exit 0
 #            return self.card(chat_id, user, int(arg))
 #        if kind == "zp" and arg.isdigit():
 #            return self.online(chat_id, user, int(arg))
+#        if kind == "ex":
+#            return self.choose_exit(chat_id, user, arg)
 #        if kind == "a":
 #            if not self.is_admin(chat_id):
 #                return self.say(chat_id, "این بخش فقط برای مدیر ربات است.")
@@ -10437,6 +10804,47 @@ exit 0
 #                         "است کمی فرق کند.")
 #        return "\n".join(lines).strip()
 #
+#    def exit_names(self):
+#        names = {"0": P.main_exit_name(self.store)}
+#        names.update({str(r["id"]): r["name"] for r in self.store.active_exits()})
+#        return names
+#
+#    def exits(self, chat, user):
+#        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+#        names = self.exit_names()
+#        if len(names) == 1:
+#            return self.say(chat, "این سرویس فقط یک سرور خروجی دارد.", self.menu(chat))
+#        measured = P.fresh_exit_pings(self.store)
+#        active = {eid: True for eid in names if eid != "0"}
+#        now_on = P.resolve_exit(user["exit_id"], measured, active)
+#        choice = user["exit_id"]
+#        rows = [[btn("%s⚡️ خودکار — همیشه کمترین پینگ" % ("✓ " if choice is None else ""),
+#                     "ex:auto")]]
+#        for eid in sorted(names, key=lambda e: (measured.get(e) is None, measured.get(e) or 0)):
+#            mine = choice is not None and str(choice) == eid
+#            rows.append([btn(("✓ " if mine else "") + exit_label(names[eid], measured.get(eid)),
+#                             "ex:%s" % eid)])
+#        self.say(chat, "🌍 سرور خروجی\n\nسایت‌ها و دانلودهای شما از این سرور به اینترنت "
+#                       "می‌روند. پینگ، زمان رسیدن از سرور ایران به هر سرور خروجی است.\n\n"
+#                       "الان از: %s%s" % (names.get(now_on, "?"),
+#                                          " (خودکار)" if choice is None else ""), kb(*rows))
+#
+#    def choose_exit(self, chat, user, arg):
+#        if arg == "auto":
+#            value = None
+#        elif arg == "0":
+#            value = 0
+#        elif arg.isdigit() and self.store.one("SELECT 1 FROM exits WHERE id = ? AND active = 1",
+#                                              (int(arg),)):
+#            value = int(arg)
+#        else:
+#            return self.say(chat, "این سرور دیگر در دسترس نیست.", self.menu(chat))
+#        self.store.run("UPDATE users SET exit_id = ? WHERE id = ?", (value, user["id"]))
+#        P.log(P.INFO, "bot: user %d chose exit %s" % (user["id"], arg))
+#        self.say(chat, "✅ خودکار شد: همیشه از سروری که کمترین پینگ را دارد." if value is None
+#                 else "✅ ذخیره شد؛ تا ۳۰ ثانیه دیگر از این سرور می‌روید.")
+#        return self.exits(chat, user)
+#
 #    def dns(self, chat, user):
 #        address = self.setting("relay_dns") or (self.relays[0] if self.relays else "")
 #        if not address:
@@ -10499,7 +10907,8 @@ exit 0
 #            [btn("📥 رسیدها (%d)" % pending, "a:rc"), btn("👥 کاربران", "a:us")],
 #            [btn("📦 پلن‌ها", "a:pl"), btn("💳 روش‌های پرداخت", "a:py")],
 #            [btn("🎁 تست رایگان", "a:tr"), btn("📊 آمار", "a:st")],
-#            [btn("📢 پیام همگانی", "a:bc"), btn("📶 پینگ", "a:pg")]))
+#            [btn("📢 پیام همگانی", "a:bc"), btn("📶 پینگ", "a:pg")],
+#            [btn("🌍 خروجی‌ها", "a:ex")]))
 #
 #    def ask(self, chat, state, text):
 #        self.state[chat] = state
@@ -10511,7 +10920,7 @@ exit 0
 #        ids = [int(x) for x in parts[1:] if x.isdigit()]
 #        pages = {"rc": self.admin_receipts, "us": self.admin_users, "pl": self.admin_plans,
 #                 "py": self.admin_payments, "st": self.admin_stats, "tr": self.admin_trial,
-#                 "pg": self.admin_pings}
+#                 "pg": self.admin_pings, "ex": self.admin_exits}
 #        if cmd in pages:
 #            return pages[cmd](chat)
 #        if cmd in ("ok", "no") and ids:
@@ -10589,6 +10998,23 @@ exit 0
 #        if cmd == "trx":
 #            self.store.set_setting("trial_on", "" if P.trial_settings(self.store)["on"] else "1")
 #            return self.admin_trial(chat)
+#        if cmd == "xn":
+#            return self.ask(chat, ("admin-exit-new",), EXIT_FORMAT)
+#        if cmd == "xe" and ids:
+#            return self.exit_card(chat, ids[0])
+#        if cmd == "xr" and ids:
+#            return self.ask(chat, ("admin-exit-name", ids[0]), "نام تازهٔ این سرور خروجی:")
+#        if cmd == "xt" and ids and ids[0] != 0:
+#            self.store.run("UPDATE exits SET active = 1 - active WHERE id = ?", (ids[0],))
+#            return self.exit_card(chat, ids[0])
+#        if cmd == "xd" and ids and ids[0] != 0:
+#            moved = self.store.run("UPDATE users SET exit_id = NULL WHERE exit_id = ?",
+#                                   (ids[0],)).rowcount
+#            self.store.run("DELETE FROM exits WHERE id = ?", (ids[0],))
+#            P.log(P.INFO, "bot: exit %d deleted by telegram %d" % (ids[0], chat))
+#            self.say(chat, "🗑 حذف شد. %d نفر که آن را انتخاب کرده بودند روی خودکار رفتند."
+#                     % moved)
+#            return self.admin_exits(chat)
 #        if cmd == "pc":
 #            return self.ask(chat, ("admin-card",), "شمارهٔ کارت و نام صاحب کارت را این‌طور "
 #                                                   "بفرستید:\n6037 9912 3456 7890 | علی رضایی")
@@ -10641,6 +11067,29 @@ exit 0
 #                done = "سرعت ذخیره شد"
 #            self.say(chat, "✅ %s%s" % (done, "؛ حساب فعال شد" if joined else ""))
 #            return self.user_card(chat, uid)
+#        if kind == "admin-exit-new":
+#            name, _, ip = text.partition("|")
+#            name, ip = name.strip()[:40], ip.translate(DIGITS).strip()
+#            why = self.exit_problem(name, ip)
+#            if why:
+#                return self.say(chat, "⚠️ %s\n\n%s" % (why, EXIT_FORMAT), cancel_kb())
+#            self.state.pop(chat, None)
+#            eid = self.store.run("INSERT INTO exits (name, ip, active, created_at)"
+#                                 " VALUES (?, ?, 1, ?)", (name, ip, P.now())).lastrowid
+#            P.log(P.INFO, "bot: exit %d (%s) added by telegram %d" % (eid, ip, chat))
+#            self.say(chat, "✅ اضافه شد. رله تا ۳۰ ثانیه دیگر آن را می‌شناسد و تا ۵ دقیقه "
+#                           "پینگش را می‌گیرد.")
+#            return self.exit_card(chat, eid)
+#        if kind == "admin-exit-name":
+#            name = text.strip()[:40]
+#            if not name:
+#                return self.say(chat, "یک نام بفرستید.", cancel_kb())
+#            self.state.pop(chat, None)
+#            if waiting[1] == 0:
+#                self.store.set_setting("main_exit_name", name)
+#            else:
+#                self.store.run("UPDATE exits SET name = ? WHERE id = ?", (name, waiting[1]))
+#            return self.exit_card(chat, waiting[1])
 #        if kind.startswith("admin-trial-"):
 #            try:
 #                value = number(text)
@@ -10885,6 +11334,62 @@ exit 0
 #            [btn("⏸ توقف فروش" if plan["active"] else "▶️ فروش دوباره", "a:pa:%d" % pid),
 #             btn("🗑 حذف", "a:pd:%d" % pid)],
 #            [btn("↩️ همهٔ پلن‌ها", "a:pl")]))
+#
+#    # exits
+#    def exit_problem(self, name, ip):
+#        if not name:
+#            return "نام لازم است."
+#        try:
+#            addr = ipaddress.IPv4Address(ip)
+#        except ValueError:
+#            return "آی‌پی درست نیست — چهار عدد با نقطه."
+#        if not addr.is_global:
+#            return "این آی‌پی عمومی نیست."
+#        if str(addr) in set(self.relays) | {self.setting("relay_dns")}:
+#            return "این آی‌پیِ رله است، نه یک سرور خروجی."
+#        if self.store.one("SELECT 1 FROM exits WHERE ip = ?", (str(addr),)):
+#            return "این سرور قبلاً اضافه شده."
+#        return ""
+#
+#    def admin_exits(self, chat):
+#        rows = self.store.q("SELECT * FROM exits ORDER BY id")
+#        measured = P.fresh_exit_pings(self.store)
+#        auto = self.store.one("SELECT count(*) c FROM users WHERE status = 'active'"
+#                              " AND exit_id IS NULL")["c"]
+#        lines = ["🌍 سرورهای خروجی", "",
+#                 "پینگ از سرور ایران تا هر خروجی. %d مشتری روی «خودکار» هستند و همیشه "
+#                 "به کمترین پینگ می‌روند." % auto]
+#        if not rows:
+#            lines += ["", "هنوز خروجی اضافه‌ای نیست. روی سرور تازه doctor-dns.sh را اجرا "
+#                          "کنید، «3) extra exit» را بزنید و آی‌پی رله را بدهید؛ بعد اینجا "
+#                          "اضافه‌اش کنید."]
+#        buttons = [[btn(exit_label(P.main_exit_name(self.store) + " (اصلی)", measured.get("0")),
+#                        "a:xe:0")]]
+#        for r in rows:
+#            buttons.append([btn(("" if r["active"] else "⏸ ")
+#                                + exit_label(r["name"], measured.get(str(r["id"]))),
+#                                "a:xe:%d" % r["id"])])
+#        buttons.append([btn("➕ خروجی تازه", "a:xn")])
+#        self.say(chat, "\n".join(lines), kb(*buttons))
+#
+#    def exit_card(self, chat, eid):
+#        measured = P.fresh_exit_pings(self.store)
+#        chosen = self.store.one("SELECT count(*) c FROM users WHERE exit_id = ?", (eid,))["c"]
+#        ms = measured.get(str(eid))
+#        if eid == 0:
+#            return self.say(chat, "%s (اصلی)\nپینگ: %s\nانتخاب کرده‌اند: %d نفر\n\nسروری که "
+#                                  "رله با آن نصب شده و پنل و ربات روی آن است. پشتیبان بقیهٔ "
+#                                  "خروجی‌ها هم هست: اگر یکی جواب ندهد، ترافیکش به این می‌آید."
+#                            % (P.main_exit_name(self.store), ms_text(ms), chosen), kb(
+#                                [btn("✏️ نام", "a:xr:0")], [btn("↩️ همهٔ خروجی‌ها", "a:ex")]))
+#        r = self.store.one("SELECT * FROM exits WHERE id = ?", (eid,))
+#        if not r:
+#            return self.say(chat, "این سرور پیدا نشد.")
+#        self.say(chat, "%s\nآی‌پی: %s\nپینگ: %s\nوضعیت: %s\nانتخاب کرده‌اند: %d نفر" % (
+#            r["name"], r["ip"], ms_text(ms), "فعال" if r["active"] else "غیرفعال", chosen), kb(
+#            [btn("✏️ نام", "a:xr:%d" % eid),
+#             btn("⏸ غیرفعال کردن" if r["active"] else "▶️ فعال کردن", "a:xt:%d" % eid)],
+#            [btn("🗑 حذف", "a:xd:%d" % eid)], [btn("↩️ همهٔ خروجی‌ها", "a:ex")]))
 #
 #    # game pings
 #    def admin_pings(self, chat):
@@ -11347,6 +11852,11 @@ exit 0
 #    role=exit
 #    status="smartdns-panel smartdns-admin smartdns-bot nginx smartdns-cert.timer"
 #    logs="smartdns-panel smartdns-admin smartdns-bot nginx smartdns-cert"
+#elif [ -f "$ETC/exit.env" ]; then
+#    # An extra exit: nginx carrying traffic, and nothing else of ours.
+#    role=extra
+#    status="nginx"
+#    logs="nginx"
 #else
 #    echo "doctor dns is not installed on this machine" >&2
 #    exit 1
@@ -11954,6 +12464,9 @@ exit 0
 #elif [ -f "$ETC/panel.env" ]; then
 #    role=exit
 #    units="smartdns-panel smartdns-admin smartdns-bot smartdns-tunnel nginx"
+#elif [ -f "$ETC/exit.env" ]; then
+#    role=extra
+#    units="nginx"
 #else
 #    echo "doctor dns is not installed on this machine" >&2
 #    exit 1
@@ -11988,7 +12501,7 @@ exit 0
 #    fi
 #    restart coturn
 #else
-#    restart smartdns-panel
+#    installed smartdns-panel && restart smartdns-panel
 #    installed smartdns-admin && restart smartdns-admin
 #    installed smartdns-bot && restart smartdns-bot
 #fi
@@ -12450,6 +12963,9 @@ exit 0
 #
 #if [ -f "$ETC/sync.env" ]; then role=relay; env="$ETC/sync.env"
 #elif [ -f "$ETC/panel.env" ]; then role=exit; env="$ETC/panel.env"
+#elif [ -f "$ETC/exit.env" ]; then
+#    echo "an extra exit has no tunnel - the relay reaches it directly; only the main exit has one."
+#    exit 0
 #else echo "doctor dns is not installed on this machine" >&2; exit 1; fi
 #
 #get() { sed -n "s/^$1=//p" "$env" 2>/dev/null | head -1; }
@@ -12542,6 +13058,7 @@ exit 0
 #[ "$(id -u)" = 0 ] || { echo "run as root:  sudo smartdns-menu" >&2; exit 1; }
 #if [ -f "$ETC/sync.env" ]; then role=relay
 #elif [ -f "$ETC/panel.env" ]; then role=exit
+#elif [ -f "$ETC/exit.env" ]; then role=extra
 #else echo "doctor dns is not installed on this machine" >&2; exit 1; fi
 #VERSION="$(cat "$VERSION_FILE" 2>/dev/null || echo '?')"
 #
@@ -12761,6 +13278,14 @@ exit 0
 #            'restart everything   (smartdns-restart)|restart_all'
 #            'installation, updates and certificates|menu_install'
 #            'telegram bot|menu_bot'
+#        )
+#    fi
+#    # An extra exit is nginx and nothing else of ours: no panel, bot or tunnel.
+#    if [ "$role" = extra ]; then
+#        items=(
+#            'status and logs|menu_logs'
+#            'restart everything   (smartdns-restart)|restart_all'
+#            'installation, updates and certificates|menu_install'
 #        )
 #    fi
 #    BACK=quit choose "doctor dns $VERSION - $role" "${items[@]}"

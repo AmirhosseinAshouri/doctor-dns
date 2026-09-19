@@ -256,6 +256,18 @@ CREATE TABLE IF NOT EXISTS outbox (
     attempts   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS outbox_unsent ON outbox(sent_at, id);
+
+-- Extra exits: servers abroad, installed as "extra exit", that carry traffic
+-- and nothing else - no database, no bot. The main exit is not a row: it is
+-- whichever one each relay was installed with, id 0 wherever an exit is named.
+-- A customer picks one in the bot, or is put on the one with the lowest ping.
+CREATE TABLE IF NOT EXISTS exits (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL,
+    ip         TEXT NOT NULL UNIQUE,
+    active     INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
 """
 
 METRIC_FIELDS = ("cpu", "load", "mem_used", "mem_total", "swap_used",
@@ -304,6 +316,10 @@ MIGRATIONS = [
     # which is what every account that predates the trial gets - so nobody
     # is refused one because of when they signed up.
     ("users", "trial_at", "TEXT"),
+    # Which exit this account's traffic leaves by: null is automatic - the
+    # one with the lowest ping from the relay - 0 the main exit, and anything
+    # else an extra exit's id.
+    ("users", "exit_id", "INTEGER"),
 ]
 
 # Indexes that have to exist whether the table was created by SCHEMA or grown
@@ -826,6 +842,27 @@ class Store:
         every = relay_pings(self)
         every[relay] = {"at": now(), "games": games}
         self.set_setting("relay_pings", json.dumps(every, ensure_ascii=False))
+
+    def active_exits(self):
+        return self.q("SELECT * FROM exits WHERE active = 1 ORDER BY id")
+
+    def note_exit_pings(self, relay, pings):
+        """Keep how fast each exit answered one relay, the latest round only."""
+        if not isinstance(pings, dict) or not pings:
+            return
+        clean = {}
+        for eid, p in list(pings.items())[:64]:
+            if not (isinstance(eid, str) and eid.isdigit() and isinstance(p, dict)):
+                continue
+            ms, loss = p.get("ms"), p.get("loss")
+            clean[eid] = {
+                "ms": float(ms) if isinstance(ms, (int, float)) and 0 <= ms < 60000 else None,
+                "loss": float(loss) if isinstance(loss, (int, float)) and 0 <= loss <= 1 else 1.0}
+        if not clean:
+            return
+        every = exit_pings(self)
+        every[relay] = {"at": now(), "exits": clean}
+        self.set_setting("relay_exit_pings", json.dumps(every))
 
     def note_relay(self, panel, dns):
         """Remember where a relay's customer pages are, and its DNS address.
@@ -1409,6 +1446,56 @@ def relay_pings(store):
     return every if isinstance(every, dict) else {}
 
 
+# ------------------------------------------------------------------ exits
+def main_exit_name(store):
+    return store.setting("main_exit_name", "") or "سرور اصلی"
+
+
+def exit_pings(store):
+    """{relay: {"at", "exits": {id: {"ms", "loss"}}}}, the latest from each."""
+    try:
+        every = json.loads(store.setting("relay_exit_pings", "") or "{}")
+    except ValueError:
+        return {}
+    return every if isinstance(every, dict) else {}
+
+
+def fresh_exit_pings(store, relay=None):
+    """{exit id: fastest ms} from recent rounds - one relay's, or the best of all.
+
+    A round older than PING_STALE_MINUTES says nothing about now, and choosing
+    an exit on it could put everybody on one that has since gone quiet."""
+    stamp = datetime.now(timezone.utc)
+    out = {}
+    for r, entry in exit_pings(store).items():
+        if (relay is not None and r != relay) or not isinstance(entry, dict):
+            continue
+        seen = parse_ts(entry.get("at"))
+        if not seen or (stamp - seen).total_seconds() > PING_STALE_MINUTES * 60:
+            continue
+        for eid, p in (entry.get("exits") or {}).items():
+            ms = p.get("ms") if isinstance(p, dict) else None
+            if isinstance(ms, (int, float)) and (eid not in out or ms < out[eid]):
+                out[eid] = ms
+    return out
+
+
+def resolve_exit(choice, measured, active):
+    """The exit an account's traffic takes, as its id in text - "0" the main.
+
+    The account's own choice while that exit is active. Otherwise - automatic,
+    or a choice that has since been switched off - the fastest exit measured,
+    and the main exit when nothing has been."""
+    if choice is not None and (choice == 0 or str(choice) in active):
+        return str(choice)
+    best, best_ms = "0", None
+    for eid in ["0"] + sorted(active, key=int):
+        ms = measured.get(eid)
+        if isinstance(ms, (int, float)) and (best_ms is None or ms < best_ms):
+            best, best_ms = eid, ms
+    return best
+
+
 def trial_settings(store):
     return {"on": store.setting("trial_on", "1") == "1",
             "gb": float(store.setting("trial_gb", "1") or 0),
@@ -1856,6 +1943,7 @@ class API(http.server.BaseHTTPRequestHandler):
             self.store.record_metrics(self.client_address[0], body.get("host") or {})
             self.store.note_relay(body.get("panel"), body.get("dns"))
             self.store.note_pings(self.client_address[0], body.get("pings"))
+            self.store.note_exit_pings(self.client_address[0], body.get("exit_pings"))
             # Quotas are evaluated here, on fresh numbers, so a user who runs
             # out is off the list this relay is about to be handed.
             try:
@@ -1874,12 +1962,25 @@ class API(http.server.BaseHTTPRequestHandler):
                         "kbps": v["kbps"], "user": v.get("user", ""),
                         "profile": str(v["tid"]) if str(v["tid"]) in profiles else ""}
                        for ip, v in sorted(by_ip.items())]
+            # Which exit each address leaves by, from this relay: the
+            # account's own choice, or the fastest this relay measured. The
+            # relay turns it into an nginx map. With no extra exits nothing is
+            # sent, and every address takes the relay's own exit.
+            exits = {str(r["id"]): {"name": r["name"], "ip": r["ip"]}
+                     for r in self.store.active_exits()}
+            if exits:
+                measured = fresh_exit_pings(self.store, self.client_address[0])
+                choices = {r["id"]: r["exit_id"] for r in self.store.q(
+                    "SELECT id, exit_id FROM users WHERE status = 'active'")}
+                for a in allowed:
+                    a["exit"] = resolve_exit(choices.get(a["uid"]), measured, exits)
             extra = [r["domain"] for r in self.store.q(
                 "SELECT domain FROM custom_domains ORDER BY domain")]
             return self.reply(200, {"allowed": allowed, "profiles": profiles,
                                     "extra_domains": extra,
                                     "templates": self.store.template_names(),
                                     "ping_targets": ping_targets(CATALOGUE),
+                                    "exits": exits,
                                     })
 
         # ---- user panel, served by the relay on the customer's behalf ----

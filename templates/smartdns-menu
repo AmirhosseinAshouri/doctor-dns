@@ -25,6 +25,7 @@ esac
 [ "$(id -u)" = 0 ] || { echo "run as root:  sudo smartdns-menu" >&2; exit 1; }
 if [ -f "$ETC/sync.env" ]; then role=relay
 elif [ -f "$ETC/panel.env" ]; then role=exit
+elif [ -f "$ETC/exit.env" ]; then role=extra
 else echo "doctor dns is not installed on this machine" >&2; exit 1; fi
 VERSION="$(cat "$VERSION_FILE" 2>/dev/null || echo '?')"
 
@@ -244,6 +245,14 @@ main() {
             'restart everything   (smartdns-restart)|restart_all'
             'installation, updates and certificates|menu_install'
             'telegram bot|menu_bot'
+        )
+    fi
+    # An extra exit is nginx and nothing else of ours: no panel, bot or tunnel.
+    if [ "$role" = extra ]; then
+        items=(
+            'status and logs|menu_logs'
+            'restart everything   (smartdns-restart)|restart_all'
+            'installation, updates and certificates|menu_install'
         )
     fi
     BACK=quit choose "doctor dns $VERSION - $role" "${items[@]}"
