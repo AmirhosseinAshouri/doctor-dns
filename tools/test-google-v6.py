@@ -106,7 +106,8 @@ check("install_payload drops the block when told to",
       '-e "${NO_GOOGLE_V6:+/# google-v6 begin/,/# google-v6 end/d}"' in logic)
 det = logic[logic.index("NO_GOOGLE_V6=1"):logic.index("install_payload EXIT_NGINX")]
 check("the default is to leave it out", det.startswith("NO_GOOGLE_V6=1"))
-check("only an exit considers it", 'if [ "$ROLE" = exit ]; then' in det)
+# Every exit - the main one and any extra one - but never a relay.
+check("only an exit considers it", 'if [ "$ROLE" != relay ]; then' in det)
 check("it needs a real IPv6 connection to Google",
       "curl -6 -s -o /dev/null -m 10 https://www.google.com/" in det)
 check("and an nginx with ipv4=off, 1.23.1 or later", "1.23.1" in det and "sort -V" in det)

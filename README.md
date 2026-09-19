@@ -241,6 +241,32 @@ names of the sites still show. In our own test **quic** and **udp** did not
 connect at all. A *direct* tunnel, where the relay dials the exit, has four
 transports: stealth, wss, tcp and ws.
 
+### Several exits (optional)
+
+A relay can send its customers out through more than one exit. The exit you
+install first stays the main one - it keeps the database, the admin panel and
+the bot. Any others are *extra exits*: servers abroad that carry traffic and
+nothing else.
+
+1. Upgrade the relay to this version first: it has to know its own exit to
+   fall back to.
+2. On the new server, run the installer and choose **3) extra exit**. Give it
+   the relay's address - several relays, comma separated. It sets up nginx to
+   let those relays in and nobody else: no panel, no bot, no second database.
+3. In the bot, **🛠 مدیریت → 🌍 خروجی‌ها → ➕**, add it by name and address.
+
+Within a minute the relay knows it, and within five it has measured it. Every
+five minutes the relay times a connection to each exit - the leg it adds to
+every customer's connection - and customers see **🌍 سرور خروجی** in the bot:
+the exits sorted by that ping, and **⚡️ automatic**, the default, which always
+puts them on the fastest. Their choice reaches nginx as a map on their address,
+rewritten only when it changes and only once `nginx -t` accepts it. If an extra
+exit stops answering, nginx sends its customers to the main exit until it is
+back.
+
+The tunnel, when there is one, stays between the relay and the main exit;
+extra exits are reached directly.
+
 ### Access control
 
 A fresh relay answers everyone. That is not a default anybody chose - it is
@@ -524,6 +550,7 @@ sudo smartdns-bot off            # forget the token
 | **🌐 ثبت آی‌پی** | a mini app that registers the address the phone is on, or type one in |
 | **📡 آدرس DNS** | the address to put in a console, phone or router |
 | **📶 پینگ بازی‌ها** | each game's ping from the Iranian server right now - green, yellow or red, fastest first |
+| **🌍 سرور خروجی** | choose an exit by its ping from the relay, or leave it on automatic - shown once there is more than one |
 
 The bot messages them on its own: at 80% and 95% of the allowance, when it
 runs out or the period ends, when a receipt is approved or rejected, and when
@@ -568,6 +595,8 @@ Under **🛠 مدیریت**:
   server's health.
 - **Pings** - each game's hosts as the relay last measured them: address, time,
   loss, and which Iran filters.
+- **Exits** - add, rename, switch off or delete extra exits, and see each one's
+  ping and how many chose it.
 - **Broadcast** - one message to everybody who has started the bot, after a
   preview.
 

@@ -104,6 +104,7 @@ install_payload() {
               -e "s#__EXIT_HTTPS__#${EXIT_HTTPS:-__EXIT_HTTPS__}#g" \
               -e "s#__EXIT_HTTP__#${EXIT_HTTP:-__EXIT_HTTP__}#g" \
               -e "${NO_TUNNEL:+/# tunnel begin/,/# tunnel end/d}" \
+              -e "${RELAY_ALLOW:+s#allow ${RELAY_IP};#${RELAY_ALLOW}#g}" \
         > "$tmp"
     [ -s "$tmp" ] || die "payload $name is empty - is this file complete?"
     # Whether this file was ours or already here decides what uninstall does
@@ -755,6 +756,7 @@ if [ -n "$INSTALLED_VERSION" ]; then
     if [ -z "$ROLE" ]; then
         if [ -f /etc/smart-dns/sync.env ]; then ROLE=relay
         elif [ -f /etc/smart-dns/panel.env ]; then ROLE=exit
+        elif [ -f /etc/smart-dns/exit.env ]; then ROLE=extra
         fi
     fi
     if [ "$ROLE" = relay ]; then
@@ -769,6 +771,11 @@ if [ -n "$INSTALLED_VERSION" ]; then
         # panel.env holds every relay this exit serves, comma separated. Any of
         # them will do here: it is already on the list, so nothing is added.
         [ -n "$PEER_IP" ] || PEER_IP="$(sed -n 's/^RELAY_IP=//p' /etc/smart-dns/panel.env 2>/dev/null | head -1 | cut -d, -f1 || true)"
+    elif [ "$ROLE" = extra ]; then
+        # Every relay this exit carries for, comma separated, and its own
+        # address - kept in exit.env, since the state file records only one.
+        [ -n "$PEER_IP" ] || PEER_IP="$(sed -n 's/^RELAY_IP=//p' /etc/smart-dns/exit.env 2>/dev/null | head -1 || true)"
+        [ -n "$SELF_IP" ] || SELF_IP="$(sed -n 's/^SELF_IP=//p' /etc/smart-dns/exit.env 2>/dev/null | head -1 || true)"
     fi
     PANEL_DOMAIN="${PANEL_DOMAIN:-$(was panel-domain)}"
     info "upgrading this ${ROLE:-machine} in place - nothing to answer"
@@ -786,28 +793,46 @@ ROLE="${ROLE:-}"; PEER_IP="${PEER_IP:-}"; SELF_IP="${SELF_IP:-}"
 
 if [ -z "$ROLE" ]; then
     printf '\n%sWhich side is this machine?%s\n\n' "$B" "$N"
-    printf '  1) relay  - the server inside Iran, the one clients point their DNS at\n'
-    printf '  2) exit   - the server abroad, which reaches the blocked sites\n\n'
+    printf '  1) relay       - the server inside Iran, the one clients point their DNS at\n'
+    printf '  2) exit        - the server abroad, which reaches the blocked sites, and\n'
+    printf '                   keeps the database, the admin panel and the bot\n'
+    printf '  3) extra exit  - another server abroad that only carries traffic; add it\n'
+    printf '                   in the bot afterwards and customers can choose it\n\n'
     while :; do
-        read -r -p "  choice [1/2]: " answer
+        read -r -p "  choice [1/2/3]: " answer
         case "$answer" in
             1|relay) ROLE=relay; break ;;
             2|exit)  ROLE=exit;  break ;;
-            *) warn "answer 1 or 2" ;;
+            3|extra) ROLE=extra; break ;;
+            *) warn "answer 1, 2 or 3" ;;
         esac
     done
 fi
-[ "$ROLE" = relay ] || [ "$ROLE" = exit ] || die "ROLE must be relay or exit"
+case "$ROLE" in relay|exit|extra) ;; *) die "ROLE must be relay, exit or extra" ;; esac
 
 if [ -z "$PEER_IP" ]; then
     printf '\n'
     if [ "$ROLE" = relay ]; then
         read -r -p "  public address of the EXIT server abroad: " PEER_IP
+    elif [ "$ROLE" = extra ]; then
+        read -r -p "  public address of the RELAY server in Iran (several: comma separated): " PEER_IP
     else
         read -r -p "  public address of the RELAY server in Iran: " PEER_IP
     fi
 fi
-valid_ip "$PEER_IP" || die "'$PEER_IP' is not an IPv4 address"
+RELAY_ALLOW=""
+if [ "$ROLE" = extra ]; then
+    # An extra exit may carry traffic for several relays. Every one of them is
+    # let in, and nobody else, so it is not an open proxy either.
+    PEER_IP="$(printf '%s' "$PEER_IP" | tr -d ' ')"
+    for ip in $(printf '%s' "$PEER_IP" | tr ',' ' '); do
+        valid_ip "$ip" || die "'$ip' is not an IPv4 address"
+        RELAY_ALLOW="${RELAY_ALLOW:+$RELAY_ALLOW }allow $ip;"
+    done
+    [ -n "$RELAY_ALLOW" ] || die "an extra exit needs the address of at least one relay"
+else
+    valid_ip "$PEER_IP" || die "'$PEER_IP' is not an IPv4 address"
+fi
 
 if [ -z "$SELF_IP" ]; then
     guess="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
@@ -821,7 +846,7 @@ valid_ip "$SELF_IP" || die "'$SELF_IP' is not an IPv4 address"
 if [ "$ROLE" = relay ]; then
     RELAY_IP="$SELF_IP"; EXIT_IP="$PEER_IP"
 else
-    RELAY_IP="$PEER_IP"; EXIT_IP="$SELF_IP"
+    RELAY_IP="${PEER_IP%%,*}"; EXIT_IP="$SELF_IP"
 fi
 
 # ------------------------------------------------------------------ panel
@@ -843,7 +868,8 @@ fi
 # Optional, like the panel. Without it the claim link is plain http, which
 # works but sends the registration token in the clear - anyone on the path can
 # take it and register their own address against the user's account.
-if [ -z "${PANEL_DOMAIN:-}" ] && [ -z "${ASSUME_YES:-}" ] && [ -z "$UPGRADE" ]; then
+if [ -z "${PANEL_DOMAIN:-}" ] && [ -z "${ASSUME_YES:-}" ] && [ -z "$UPGRADE" ] \
+   && [ "$ROLE" != extra ]; then
     printf '\n%sHTTPS%s (optional - press enter to skip)\n\n' "$B" "$N"
     if [ "$ROLE" = relay ]; then
         printf '  A name pointing at this machine, for the page users open to\n'
@@ -875,7 +901,8 @@ env_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1 || true; }
 # --tunnel: ask again on a machine that is already set up. The exit shows the
 # menu with what it has now as the defaults; the relay asks for the exit's new
 # pairing token, which carries the answer.
-if [ -n "${ASK_TUNNEL:-}" ] && [ -z "$TUNNEL" ]; then
+# An extra exit has no tunnel: that runs between a relay and its main exit.
+if [ -n "${ASK_TUNNEL:-}" ] && [ -z "$TUNNEL" ] && [ "$ROLE" != extra ]; then
     if [ "$ROLE" = exit ]; then
         CUR_TUNNEL="$(env_get /etc/smart-dns/panel.env TUNNEL)"
         CUR_TRANSPORT="$(env_get /etc/smart-dns/panel.env TUNNEL_TRANSPORT)"
@@ -1131,7 +1158,7 @@ info "stream module: $MOD"
 # that can be told to ask for AAAA records only, which nginx has from 1.23.1 -
 # older, or without IPv6, the block is left out and nothing changes.
 NO_GOOGLE_V6=1
-if [ "$ROLE" = exit ]; then
+if [ "$ROLE" != relay ]; then
     ngv="$(nginx -v 2>&1 | sed -n 's#.*nginx/\([0-9.]*\).*#\1#p')"
     if [ "$(printf '%s\n%s\n' 1.23.1 "${ngv:-0}" | sort -V | head -1)" = 1.23.1 ] \
        && curl -6 -s -o /dev/null -m 10 https://www.google.com/ 2>/dev/null; then
@@ -1154,6 +1181,17 @@ else
     NO_TUNNEL=1; EXIT_HTTPS="$EXIT_IP:443"; EXIT_HTTP="$EXIT_IP:80"
 fi
 if [ "$ROLE" = relay ]; then
+    # The map of which exit each customer leaves by, which nginx.conf includes.
+    # smartdns-sync keeps it from here on. Written now with only the default,
+    # so nginx has something to load, and again whenever the default itself
+    # changes - a tunnel switched on or off - which the sync then fills back in
+    # within a minute.
+    note_file /etc/nginx/smartdns-exits.conf
+    if ! grep -qsF "default ${EXIT_HTTPS};" /etc/nginx/smartdns-exits.conf; then
+        printf '# written by the installer; smartdns-sync keeps it from here\nmap $remote_addr $smartdns_exit_https {\n    default %s;\n}\nmap $remote_addr $smartdns_exit_http {\n    default %s;\n}\n' \
+            "$EXIT_HTTPS" "$EXIT_HTTP" > /etc/nginx/smartdns-exits.conf
+        NGINX_CHANGED=1
+    fi
     install_payload RELAY_NGINX /etc/nginx/nginx.conf && NGINX_CHANGED=1 || true
 else
     install_payload EXIT_NGINX /etc/nginx/nginx.conf && NGINX_CHANGED=1 || true
@@ -1629,6 +1667,21 @@ fi
 # on every run meant an upgrade run without it skipped this whole section and
 # silently left the old agent in place - the machine kept syncing, so nothing
 # looked wrong, while the new code never arrived.
+# ------------------------------------------------------------- extra exit
+# A server that carries traffic and nothing else: no database, no admin
+# panel, no bot - the main exit keeps those, and learns of this one when it is
+# added in the bot. What is kept here is only what a re-run needs to know what
+# this machine is, and which relays it lets in.
+if [ "$ROLE" = extra ]; then
+    step "Extra exit"
+    mkdir -p /etc/smart-dns; chmod 700 /etc/smart-dns
+    note_file /etc/smart-dns/exit.env
+    umask 077
+    printf 'RELAY_IP=%s\nSELF_IP=%s\n' "$PEER_IP" "$SELF_IP" > /etc/smart-dns/exit.env
+    umask 022
+    info "carries traffic for $PEER_IP and nobody else"
+fi
+
 if [ "$ROLE" = relay ] && [ -z "${SYNC_TOKEN:-}" ] && [ -f /etc/smart-dns/sync.env ]; then
     SYNC_TOKEN="$(sed -n 's/^SYNC_SECRET=//p' /etc/smart-dns/sync.env | head -1 || true).$(sed -n 's/^SYNC_FINGERPRINT=//p' /etc/smart-dns/sync.env | head -1 || true)"
     PANEL_IP="${PANEL_IP:-$(sed -n 's/^PANEL_HOST=//p' /etc/smart-dns/sync.env | head -1 || true)}"
@@ -1686,6 +1739,9 @@ EOF
         set_env_key /etc/smart-dns/sync.env PANEL_DOMAIN "${PANEL_DOMAIN:-}"
     fi
     set_env_key /etc/smart-dns/sync.env TUNNEL "$TUNNEL"
+    # The exit every customer leaves by unless they are on an extra one, and
+    # the backup for all of those.
+    set_env_key /etc/smart-dns/sync.env EXIT_IP "$EXIT_IP"
     set_env_key /etc/smart-dns/sync.env TUNNEL_TRANSPORT "${TUNNEL_TRANSPORT:-}"
     set_env_key /etc/smart-dns/sync.env TUNNEL_DIRECTION "${TUNNEL_DIRECTION:-}"
     set_env_key /etc/smart-dns/sync.env TUNNEL_PORT "${TUNNEL_PORT:-}"
@@ -1848,6 +1904,18 @@ if [ "$ROLE" = relay ]; then
     Manage the list with:  smartdns status | list | add | del | bypass
 
 ' "$RELAY_IP"
+elif [ "$ROLE" = extra ]; then
+    printf '
+    This extra exit carries traffic for %s and accepts nothing else.
+    Add it in the Telegram bot, under 🛠 مدیریت -> 🌍 خروجی‌ها -> ➕:
+
+        a name | %s
+
+    Customers can then choose it, or be put on it automatically whenever it
+    has the lowest ping from their relay. Upgrade the relay to this version
+    first, if you have not - it needs to know its own exit to fall back to.
+
+' "$PEER_IP" "$SELF_IP"
 else
     printf '
     This exit only accepts connections from %s, so it is not an open proxy.

@@ -154,11 +154,12 @@ MENU_IP = "🌐 ثبت آی‌پی"
 MENU_DNS = "📡 آدرس DNS"
 MENU_HELP = "❓ راهنما"
 MENU_PING = "📶 پینگ بازی‌ها"
+MENU_EXIT = "🌍 سرور خروجی"
 MENU_ADMIN = "🛠 مدیریت"
 MENU_CANCEL = "انصراف"
 MENU_ACTIONS = {MENU_ACCOUNT: "account", MENU_BUY: "buy", MENU_IP: "ip",
                 MENU_DNS: "dns", MENU_HELP: "help", MENU_ADMIN: "admin_home",
-                MENU_PING: "pings"}
+                MENU_PING: "pings", MENU_EXIT: "exits"}
 
 STATUS = {"active": "✅ فعال", "pending": "⏳ در انتظار خرید پلن",
           "over_quota": "⛔️ حجم تمام شده", "expired": "⌛️ دوره تمام شده",
@@ -233,6 +234,23 @@ def parse_plan(text):
         return None, "قیمت باید عدد صحیح و دست‌کم ۱٬۰۰۰ تومان باشد."
     return {"name": name, "quota_gb": gb, "days": int(days),
             "speed_mbps": mbps, "price": int(price)}, ""
+
+
+EXIT_FORMAT = ("نام و آی‌پی سرور خروجی را این‌طور بفرستید:\n"
+               "آلمان ۲ | 203.0.113.10\n\n"
+               "اول روی آن سرور doctor-dns.sh را اجرا کنید، گزینهٔ «3) extra exit» را بزنید "
+               "و آی‌پی رله را بدهید.")
+
+
+def ms_text(ms):
+    return ("%d ms" % round(ms)) if isinstance(ms, (int, float)) else "اندازه‌گیری نشده"
+
+
+def exit_label(name, ms):
+    if not isinstance(ms, (int, float)):
+        return "⚫ %s — اندازه‌گیری نشده" % name
+    dot = "🟢" if ms < 80 else ("🟡" if ms < 150 else "🔴")
+    return "%s %s — %d ms" % (dot, name, round(ms))
 
 
 def game_ping(game):
@@ -356,6 +374,9 @@ class Bot:
 
     def menu(self, chat):
         rows = [[MENU_ACCOUNT, MENU_BUY], [MENU_IP, MENU_DNS], [MENU_PING, MENU_HELP]]
+        # Only when there is a choice to make: one exit is no choice.
+        if self.store.active_exits():
+            rows.insert(2, [MENU_EXIT])
         if self.is_admin(chat):
             rows.append([MENU_ADMIN])
         return {"keyboard": [[{"text": t} for t in r] for r in rows],
@@ -454,6 +475,8 @@ class Bot:
             return self.card(chat_id, user, int(arg))
         if kind == "zp" and arg.isdigit():
             return self.online(chat_id, user, int(arg))
+        if kind == "ex":
+            return self.choose_exit(chat_id, user, arg)
         if kind == "a":
             if not self.is_admin(chat_id):
                 return self.say(chat_id, "این بخش فقط برای مدیر ربات است.")
@@ -698,6 +721,47 @@ class Bot:
                          "است کمی فرق کند.")
         return "\n".join(lines).strip()
 
+    def exit_names(self):
+        names = {"0": P.main_exit_name(self.store)}
+        names.update({str(r["id"]): r["name"] for r in self.store.active_exits()})
+        return names
+
+    def exits(self, chat, user):
+        user = self.store.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+        names = self.exit_names()
+        if len(names) == 1:
+            return self.say(chat, "این سرویس فقط یک سرور خروجی دارد.", self.menu(chat))
+        measured = P.fresh_exit_pings(self.store)
+        active = {eid: True for eid in names if eid != "0"}
+        now_on = P.resolve_exit(user["exit_id"], measured, active)
+        choice = user["exit_id"]
+        rows = [[btn("%s⚡️ خودکار — همیشه کمترین پینگ" % ("✓ " if choice is None else ""),
+                     "ex:auto")]]
+        for eid in sorted(names, key=lambda e: (measured.get(e) is None, measured.get(e) or 0)):
+            mine = choice is not None and str(choice) == eid
+            rows.append([btn(("✓ " if mine else "") + exit_label(names[eid], measured.get(eid)),
+                             "ex:%s" % eid)])
+        self.say(chat, "🌍 سرور خروجی\n\nسایت‌ها و دانلودهای شما از این سرور به اینترنت "
+                       "می‌روند. پینگ، زمان رسیدن از سرور ایران به هر سرور خروجی است.\n\n"
+                       "الان از: %s%s" % (names.get(now_on, "?"),
+                                          " (خودکار)" if choice is None else ""), kb(*rows))
+
+    def choose_exit(self, chat, user, arg):
+        if arg == "auto":
+            value = None
+        elif arg == "0":
+            value = 0
+        elif arg.isdigit() and self.store.one("SELECT 1 FROM exits WHERE id = ? AND active = 1",
+                                              (int(arg),)):
+            value = int(arg)
+        else:
+            return self.say(chat, "این سرور دیگر در دسترس نیست.", self.menu(chat))
+        self.store.run("UPDATE users SET exit_id = ? WHERE id = ?", (value, user["id"]))
+        P.log(P.INFO, "bot: user %d chose exit %s" % (user["id"], arg))
+        self.say(chat, "✅ خودکار شد: همیشه از سروری که کمترین پینگ را دارد." if value is None
+                 else "✅ ذخیره شد؛ تا ۳۰ ثانیه دیگر از این سرور می‌روید.")
+        return self.exits(chat, user)
+
     def dns(self, chat, user):
         address = self.setting("relay_dns") or (self.relays[0] if self.relays else "")
         if not address:
@@ -760,7 +824,8 @@ class Bot:
             [btn("📥 رسیدها (%d)" % pending, "a:rc"), btn("👥 کاربران", "a:us")],
             [btn("📦 پلن‌ها", "a:pl"), btn("💳 روش‌های پرداخت", "a:py")],
             [btn("🎁 تست رایگان", "a:tr"), btn("📊 آمار", "a:st")],
-            [btn("📢 پیام همگانی", "a:bc"), btn("📶 پینگ", "a:pg")]))
+            [btn("📢 پیام همگانی", "a:bc"), btn("📶 پینگ", "a:pg")],
+            [btn("🌍 خروجی‌ها", "a:ex")]))
 
     def ask(self, chat, state, text):
         self.state[chat] = state
@@ -772,7 +837,7 @@ class Bot:
         ids = [int(x) for x in parts[1:] if x.isdigit()]
         pages = {"rc": self.admin_receipts, "us": self.admin_users, "pl": self.admin_plans,
                  "py": self.admin_payments, "st": self.admin_stats, "tr": self.admin_trial,
-                 "pg": self.admin_pings}
+                 "pg": self.admin_pings, "ex": self.admin_exits}
         if cmd in pages:
             return pages[cmd](chat)
         if cmd in ("ok", "no") and ids:
@@ -850,6 +915,23 @@ class Bot:
         if cmd == "trx":
             self.store.set_setting("trial_on", "" if P.trial_settings(self.store)["on"] else "1")
             return self.admin_trial(chat)
+        if cmd == "xn":
+            return self.ask(chat, ("admin-exit-new",), EXIT_FORMAT)
+        if cmd == "xe" and ids:
+            return self.exit_card(chat, ids[0])
+        if cmd == "xr" and ids:
+            return self.ask(chat, ("admin-exit-name", ids[0]), "نام تازهٔ این سرور خروجی:")
+        if cmd == "xt" and ids and ids[0] != 0:
+            self.store.run("UPDATE exits SET active = 1 - active WHERE id = ?", (ids[0],))
+            return self.exit_card(chat, ids[0])
+        if cmd == "xd" and ids and ids[0] != 0:
+            moved = self.store.run("UPDATE users SET exit_id = NULL WHERE exit_id = ?",
+                                   (ids[0],)).rowcount
+            self.store.run("DELETE FROM exits WHERE id = ?", (ids[0],))
+            P.log(P.INFO, "bot: exit %d deleted by telegram %d" % (ids[0], chat))
+            self.say(chat, "🗑 حذف شد. %d نفر که آن را انتخاب کرده بودند روی خودکار رفتند."
+                     % moved)
+            return self.admin_exits(chat)
         if cmd == "pc":
             return self.ask(chat, ("admin-card",), "شمارهٔ کارت و نام صاحب کارت را این‌طور "
                                                    "بفرستید:\n6037 9912 3456 7890 | علی رضایی")
@@ -902,6 +984,29 @@ class Bot:
                 done = "سرعت ذخیره شد"
             self.say(chat, "✅ %s%s" % (done, "؛ حساب فعال شد" if joined else ""))
             return self.user_card(chat, uid)
+        if kind == "admin-exit-new":
+            name, _, ip = text.partition("|")
+            name, ip = name.strip()[:40], ip.translate(DIGITS).strip()
+            why = self.exit_problem(name, ip)
+            if why:
+                return self.say(chat, "⚠️ %s\n\n%s" % (why, EXIT_FORMAT), cancel_kb())
+            self.state.pop(chat, None)
+            eid = self.store.run("INSERT INTO exits (name, ip, active, created_at)"
+                                 " VALUES (?, ?, 1, ?)", (name, ip, P.now())).lastrowid
+            P.log(P.INFO, "bot: exit %d (%s) added by telegram %d" % (eid, ip, chat))
+            self.say(chat, "✅ اضافه شد. رله تا ۳۰ ثانیه دیگر آن را می‌شناسد و تا ۵ دقیقه "
+                           "پینگش را می‌گیرد.")
+            return self.exit_card(chat, eid)
+        if kind == "admin-exit-name":
+            name = text.strip()[:40]
+            if not name:
+                return self.say(chat, "یک نام بفرستید.", cancel_kb())
+            self.state.pop(chat, None)
+            if waiting[1] == 0:
+                self.store.set_setting("main_exit_name", name)
+            else:
+                self.store.run("UPDATE exits SET name = ? WHERE id = ?", (name, waiting[1]))
+            return self.exit_card(chat, waiting[1])
         if kind.startswith("admin-trial-"):
             try:
                 value = number(text)
@@ -1146,6 +1251,62 @@ class Bot:
             [btn("⏸ توقف فروش" if plan["active"] else "▶️ فروش دوباره", "a:pa:%d" % pid),
              btn("🗑 حذف", "a:pd:%d" % pid)],
             [btn("↩️ همهٔ پلن‌ها", "a:pl")]))
+
+    # exits
+    def exit_problem(self, name, ip):
+        if not name:
+            return "نام لازم است."
+        try:
+            addr = ipaddress.IPv4Address(ip)
+        except ValueError:
+            return "آی‌پی درست نیست — چهار عدد با نقطه."
+        if not addr.is_global:
+            return "این آی‌پی عمومی نیست."
+        if str(addr) in set(self.relays) | {self.setting("relay_dns")}:
+            return "این آی‌پیِ رله است، نه یک سرور خروجی."
+        if self.store.one("SELECT 1 FROM exits WHERE ip = ?", (str(addr),)):
+            return "این سرور قبلاً اضافه شده."
+        return ""
+
+    def admin_exits(self, chat):
+        rows = self.store.q("SELECT * FROM exits ORDER BY id")
+        measured = P.fresh_exit_pings(self.store)
+        auto = self.store.one("SELECT count(*) c FROM users WHERE status = 'active'"
+                              " AND exit_id IS NULL")["c"]
+        lines = ["🌍 سرورهای خروجی", "",
+                 "پینگ از سرور ایران تا هر خروجی. %d مشتری روی «خودکار» هستند و همیشه "
+                 "به کمترین پینگ می‌روند." % auto]
+        if not rows:
+            lines += ["", "هنوز خروجی اضافه‌ای نیست. روی سرور تازه doctor-dns.sh را اجرا "
+                          "کنید، «3) extra exit» را بزنید و آی‌پی رله را بدهید؛ بعد اینجا "
+                          "اضافه‌اش کنید."]
+        buttons = [[btn(exit_label(P.main_exit_name(self.store) + " (اصلی)", measured.get("0")),
+                        "a:xe:0")]]
+        for r in rows:
+            buttons.append([btn(("" if r["active"] else "⏸ ")
+                                + exit_label(r["name"], measured.get(str(r["id"]))),
+                                "a:xe:%d" % r["id"])])
+        buttons.append([btn("➕ خروجی تازه", "a:xn")])
+        self.say(chat, "\n".join(lines), kb(*buttons))
+
+    def exit_card(self, chat, eid):
+        measured = P.fresh_exit_pings(self.store)
+        chosen = self.store.one("SELECT count(*) c FROM users WHERE exit_id = ?", (eid,))["c"]
+        ms = measured.get(str(eid))
+        if eid == 0:
+            return self.say(chat, "%s (اصلی)\nپینگ: %s\nانتخاب کرده‌اند: %d نفر\n\nسروری که "
+                                  "رله با آن نصب شده و پنل و ربات روی آن است. پشتیبان بقیهٔ "
+                                  "خروجی‌ها هم هست: اگر یکی جواب ندهد، ترافیکش به این می‌آید."
+                            % (P.main_exit_name(self.store), ms_text(ms), chosen), kb(
+                                [btn("✏️ نام", "a:xr:0")], [btn("↩️ همهٔ خروجی‌ها", "a:ex")]))
+        r = self.store.one("SELECT * FROM exits WHERE id = ?", (eid,))
+        if not r:
+            return self.say(chat, "این سرور پیدا نشد.")
+        self.say(chat, "%s\nآی‌پی: %s\nپینگ: %s\nوضعیت: %s\nانتخاب کرده‌اند: %d نفر" % (
+            r["name"], r["ip"], ms_text(ms), "فعال" if r["active"] else "غیرفعال", chosen), kb(
+            [btn("✏️ نام", "a:xr:%d" % eid),
+             btn("⏸ غیرفعال کردن" if r["active"] else "▶️ فعال کردن", "a:xt:%d" % eid)],
+            [btn("🗑 حذف", "a:xd:%d" % eid)], [btn("↩️ همهٔ خروجی‌ها", "a:ex")]))
 
     # game pings
     def admin_pings(self, chat):

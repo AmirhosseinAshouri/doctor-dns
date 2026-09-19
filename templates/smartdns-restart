@@ -31,6 +31,9 @@ if [ -f "$ETC/sync.env" ]; then
 elif [ -f "$ETC/panel.env" ]; then
     role=exit
     units="smartdns-panel smartdns-admin smartdns-bot smartdns-tunnel nginx"
+elif [ -f "$ETC/exit.env" ]; then
+    role=extra
+    units="nginx"
 else
     echo "doctor dns is not installed on this machine" >&2
     exit 1
@@ -65,7 +68,7 @@ if [ "$role" = relay ]; then
     fi
     restart coturn
 else
-    restart smartdns-panel
+    installed smartdns-panel && restart smartdns-panel
     installed smartdns-admin && restart smartdns-admin
     installed smartdns-bot && restart smartdns-bot
 fi

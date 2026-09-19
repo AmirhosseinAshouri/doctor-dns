@@ -920,17 +920,170 @@ def ping_loop():
     while True:
         with PING_LOCK:
             targets = dict(PING_TARGETS)
-        if not targets:
+            exits = dict(EXIT_TARGETS)
+            ready = SYNCED[0]
+        if not ready:
             time.sleep(10)          # the first sync has not said what yet
             continue
         try:
-            result = ping_round(targets)
+            result = ping_round(targets) if targets else {}
             with PING_LOCK:
                 PINGS.clear()
                 PINGS.update(result)
         except Exception as e:
             log(WARN, "game pings failed: %s" % e)
+        try:
+            measured = ping_exits(exits)
+            with PING_LOCK:
+                EXIT_PINGS.clear()
+                EXIT_PINGS.update(measured)
+        except Exception as e:
+            log(WARN, "exit pings failed: %s" % e)
         time.sleep(PING_EVERY)
+
+
+# ------------------------------------------------------------------ exits
+# Several exits: the one this relay was installed with - "0" everywhere, the
+# default, and the backup for every other - and any extra ones the panel lists,
+# servers abroad that carry traffic and nothing else. nginx sends each
+# customer's connections to their exit by a map on their address, kept in a
+# file of its own so that rewriting it never touches nginx.conf.
+EXITS_CONF = "/etc/nginx/smartdns-exits.conf"
+EXIT_TARGETS = {}       # id -> {"name", "ip"}: the extra exits, from the panel
+EXIT_PINGS = {}         # the last round's exit pings, until the next sync
+SYNCED = [False]        # whether the panel has answered once, since start
+
+
+def clean_exits(exits):
+    """The panel's list of extra exits, keeping only what nginx can be given."""
+    out = {}
+    if not isinstance(exits, dict):
+        return out
+    for eid, e in exits.items():
+        if not (isinstance(eid, str) and eid.isdigit() and eid != "0" and isinstance(e, dict)):
+            continue
+        try:
+            if not ipaddress.IPv4Address(e.get("ip")).is_global:
+                continue
+        except (ValueError, TypeError):
+            continue
+        out[eid] = {"name": str(e.get("name") or eid)[:40], "ip": str(e["ip"])}
+    return out
+
+
+def note_exit_targets(exits):
+    clean = clean_exits(exits)
+    with PING_LOCK:
+        EXIT_TARGETS.clear()
+        EXIT_TARGETS.update(clean)
+        SYNCED[0] = True
+    return clean
+
+
+def take_exit_pings():
+    with PING_LOCK:
+        out = dict(EXIT_PINGS)
+        EXIT_PINGS.clear()
+    return out
+
+
+def ping_exits(exits):
+    """Time a connection from here to every exit: {id: {"ms", "loss"}}.
+
+    The leg this relay adds to every customer connection, so it is the number
+    that decides which exit is fastest. An exit's nginx lets this relay in and
+    nobody else, so the handshake answers."""
+    jobs = {}
+    if (CFG or {}).get("EXIT_IP"):
+        jobs["0"] = CFG["EXIT_IP"]
+    jobs.update({eid: e["ip"] for eid, e in exits.items()})
+    out = {}
+    if not jobs:
+        return out
+    keys = list(jobs)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for eid, (ms, loss) in zip(keys, pool.map(time_host, [jobs[k] for k in keys])):
+            out[eid] = {"ms": ms, "loss": loss}
+    return out
+
+
+def default_exit():
+    """(https, http) targets for everybody not on an extra exit: the tunnel's
+    upstreams when there is one - they fall back to the exit by themselves -
+    and the exit's own address when there is not."""
+    if (CFG or {}).get("TUNNEL") == "backpack":
+        return "to_exit_https", "to_exit_http"
+    ip = (CFG or {}).get("EXIT_IP", "")
+    return "%s:443" % ip, "%s:80" % ip
+
+
+def exits_conf(exits, assignment):
+    """The nginx include: a map per protocol, and an upstream per extra exit
+    that falls back to this relay's own exit when it does not answer."""
+    https, http = default_exit()
+    main = (CFG or {}).get("EXIT_IP", "")
+    lines = ["# written by smartdns-sync whenever it changes - edits here are lost", ""]
+    for proto, default in (("https", https), ("http", http)):
+        lines.append("map $remote_addr $smartdns_exit_%s {" % proto)
+        lines.append("    default %s;" % default)
+        for ip, eid in sorted(assignment.items()):
+            if eid in exits:
+                lines.append("    %s exit_%s_%s;" % (ip, eid, proto))
+        lines.append("}")
+    for eid in sorted(exits, key=int):
+        for proto, port in (("https", 443), ("http", 80)):
+            lines.append("upstream exit_%s_%s {" % (eid, proto))
+            lines.append("    server %s:%d;" % (exits[eid]["ip"], port))
+            if main and main != exits[eid]["ip"]:
+                lines.append("    server %s:%d backup;" % (main, port))
+            lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def _write_exits(text):
+    tmp = EXITS_CONF + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, EXITS_CONF)
+
+
+def apply_exits(exits, assignment):
+    """Point each address at its exit: rewrite the map and reload nginx - only
+    when it has changed, and only if nginx accepts it."""
+    if not (CFG or {}).get("EXIT_IP"):
+        # Installed by a version from before several exits; the next run of
+        # the installer on this relay records its exit, and this starts then.
+        return False
+    chosen = {}
+    for ip, eid in assignment.items():
+        try:
+            ipaddress.IPv4Address(ip)
+        except (ValueError, TypeError):
+            continue
+        if eid in exits:
+            chosen[ip] = eid
+    want = exits_conf(exits, chosen)
+    try:
+        with open(EXITS_CONF) as fh:
+            have = fh.read()
+    except OSError:
+        have = None
+    if want == have:
+        return False
+    _write_exits(want)
+    test = sh("nginx", "-t")
+    if test.returncode != 0:
+        if have is not None:
+            _write_exits(have)
+        log(ERROR, "exits: nginx refused the new map, so the old one stays:\n%s"
+            % (test.stderr or "").strip()[-400:])
+        return False
+    r = sh("systemctl", "reload", "nginx")
+    if r.returncode != 0:
+        log(ERROR, "exits: nginx did not reload: %s" % (r.stderr or "").strip()[-200:])
+        return False
+    log(INFO, "exits: %d extra, %d addresses on one of them" % (len(exits), len(chosen)))
+    return True
 
 
 def sync_once():
@@ -953,8 +1106,12 @@ def sync_once():
     pings = take_pings()
     if pings:
         report["pings"] = pings
+    exit_pings = take_exit_pings()
+    if exit_pings:
+        report["exit_pings"] = exit_pings
     answer = post("/sync", report)
     note_ping_targets(answer.get("ping_targets"))
+    exits = note_exit_targets(answer.get("exits"))
     try:
         save_template_names(answer.get("templates"))
     except Exception as e:
@@ -984,6 +1141,15 @@ def sync_once():
         apply_speeds(answer.get("allowed") or [])
     except Exception as e:
         log_exception("speeds failed: %s" % e)
+
+    # Which exit each address leaves by - before the allowlist, as the
+    # resolvers and speeds are, so a new address is pointed at its exit no
+    # later than the moment it is let in.
+    try:
+        apply_exits(exits, {a["ip"]: str(a.get("exit") or "")
+                            for a in answer.get("allowed") or [] if a.get("ip")})
+    except Exception as e:
+        log_exception("exits failed: %s" % e)
 
     for ip in sorted(want - have):
         r = acl("add", ip, names[ip]) if names[ip] else acl("add", ip)
