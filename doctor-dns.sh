@@ -4045,6 +4045,38 @@ exit 0
 #            (user_id, ip, now()))
 #        return {"ok": True, "message": "آی‌پی %s ثبت شد" % ip}
 #
+#    def note_pings(self, relay, pings):
+#        """Keep the latest game pings a relay measured, one entry per relay.
+#
+#        What comes in is checked field by field and kept small: it is shown to
+#        customers in the bot, and a relay is trusted to report its own numbers,
+#        not to write arbitrary text into their chats.
+#        """
+#        if not isinstance(pings, dict) or not pings:
+#            return
+#        games = {}
+#        for key, v in list(pings.items())[:64]:
+#            if not (isinstance(key, str) and re.fullmatch(r"[a-z0-9_-]{1,32}", key)
+#                    and isinstance(v, dict)):
+#                continue
+#            hosts = []
+#            for h in (v.get("hosts") or [])[:16]:
+#                if not isinstance(h, dict):
+#                    continue
+#                ms, loss = h.get("ms"), h.get("loss")
+#                hosts.append({
+#                    "host": str(h.get("host") or "")[:253],
+#                    "ip": h["ip"] if isinstance(h.get("ip"), str) and valid_ip(h["ip"]) else "",
+#                    "ms": float(ms) if isinstance(ms, (int, float)) and 0 <= ms < 60000 else None,
+#                    "loss": float(loss) if isinstance(loss, (int, float)) and 0 <= loss <= 1 else 1.0,
+#                    "state": str(h.get("state") or "")[:16]})
+#            games[key] = {"label": str(v.get("label") or key)[:40], "hosts": hosts}
+#        if not games:
+#            return
+#        every = relay_pings(self)
+#        every[relay] = {"at": now(), "games": games}
+#        self.set_setting("relay_pings", json.dumps(every, ensure_ascii=False))
+#
 #    def note_relay(self, panel, dns):
 #        """Remember where a relay's customer pages are, and its DNS address.
 #
@@ -4585,6 +4617,48 @@ exit 0
 #    return user
 #
 #
+## ------------------------------------------------------------- game pings
+## The catalogue's games, whose domains the relays ping so that customers can see
+## how each game's servers answer from Iran. The relay pings, not this machine:
+## this one is abroad, and its ping says nothing about an Iranian line.
+#GAME_SERVICES = ("playstation", "xbox", "nintendo", "steam", "epic", "ea", "blizzard",
+#                 "ubisoft", "riot", "rockstar", "bethesda", "gog", "roblox", "minecraft")
+#PING_HOSTS_PER_GAME = 4
+## Older than this and the bot says so: the relay measures every five minutes,
+## so a quarter of an hour without news means it has stopped.
+#PING_STALE_MINUTES = 15
+#
+#
+#def ping_targets(catalogue):
+#    """What each relay should ping: {service: {"label", "hosts"}}.
+#
+#    Taken from the catalogue rather than kept as a list of its own, so a game
+#    added to it is pinged too. A few domains per game, not all of them.
+#    """
+#    out = {}
+#    for svc in catalogue or []:
+#        if svc.get("key") not in GAME_SERVICES:
+#            continue
+#        hosts = []
+#        for grp in svc.get("groups") or []:
+#            for d in grp.get("domains") or []:
+#                if d not in hosts:
+#                    hosts.append(d)
+#        if hosts:
+#            out[svc["key"]] = {"label": svc.get("label") or svc["key"],
+#                               "hosts": hosts[:PING_HOSTS_PER_GAME]}
+#    return out
+#
+#
+#def relay_pings(store):
+#    """{relay address: {"at": when, "games": {...}}}, the latest from each."""
+#    try:
+#        every = json.loads(store.setting("relay_pings", "") or "{}")
+#    except ValueError:
+#        return {}
+#    return every if isinstance(every, dict) else {}
+#
+#
 #def trial_settings(store):
 #    return {"on": store.setting("trial_on", "1") == "1",
 #            "gb": float(store.setting("trial_gb", "1") or 0),
@@ -5031,6 +5105,7 @@ exit 0
 #            # second relay appears on its own without any configuration.
 #            self.store.record_metrics(self.client_address[0], body.get("host") or {})
 #            self.store.note_relay(body.get("panel"), body.get("dns"))
+#            self.store.note_pings(self.client_address[0], body.get("pings"))
 #            # Quotas are evaluated here, on fresh numbers, so a user who runs
 #            # out is off the list this relay is about to be handed.
 #            try:
@@ -5054,6 +5129,7 @@ exit 0
 #            return self.reply(200, {"allowed": allowed, "profiles": profiles,
 #                                    "extra_domains": extra,
 #                                    "templates": self.store.template_names(),
+#                                    "ping_targets": ping_targets(CATALOGUE),
 #                                    })
 #
 #        # ---- user panel, served by the relay on the customer's behalf ----
@@ -5521,6 +5597,7 @@ exit 0
 #"""
 #
 #import base64
+#import concurrent.futures
 #import hashlib
 #import hmac
 #import html
@@ -5531,7 +5608,9 @@ exit 0
 #import json
 #import os
 #import re
+#import socket
 #import ssl
+#import struct
 #import subprocess
 #import sys
 #import threading
@@ -6270,6 +6349,161 @@ exit 0
 #          % allowed_count, flush=True)
 #
 #
+## ---------------------------------------------------------------- game pings
+## How the games' servers answer from this relay, for the Telegram bot to show:
+## a TCP connection to each game's domains, timed. TCP rather than ICMP, because
+## many game servers ignore ping, and a connection is what a game makes anyway.
+##
+## Names are asked of public resolvers directly, never of this machine's own
+## dnsmasq: that answers every routed name with this relay's address, and a
+## ping to ourselves says nothing. The exit says which domains, on every sync.
+#PING_EVERY = 300
+#PING_TRIES = 3
+#PING_TIMEOUT = 2.0
+#PING_PORTS = (443, 80)
+#PING_RESOLVERS = ("1.1.1.1", "8.8.8.8")
+#DNS_PORT = 53
+## The address Iran's filtering hands out for a name it blocks. Such a name is
+## reported as filtered and never connected to.
+#FILTERED_PREFIX = "10.10.34."
+#PING_TARGETS = {}       # what to ping, from the exit
+#PINGS = {}              # the last round, until the next sync takes it
+#PING_LOCK = threading.Lock()
+#
+#
+#def _skip_name(data, pos):
+#    while pos < len(data):
+#        n = data[pos]
+#        if n == 0:
+#            return pos + 1
+#        if n & 0xC0 == 0xC0:
+#            return pos + 2
+#        pos += n + 1
+#    return pos
+#
+#
+#def _first_a(data, qid):
+#    """The first A record in a DNS answer, or None."""
+#    if len(data) < 12:
+#        return None
+#    rid, flags, qd, an = struct.unpack(">HHHH", data[:8])
+#    if rid != qid or flags & 0x000F:
+#        return None
+#    pos = 12
+#    for _ in range(qd):
+#        pos = _skip_name(data, pos) + 4
+#    for _ in range(an):
+#        pos = _skip_name(data, pos)
+#        if pos + 10 > len(data):
+#            return None
+#        rtype, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[pos:pos + 10])
+#        pos += 10
+#        if rtype == 1 and rdlen == 4:
+#            return socket.inet_ntoa(data[pos:pos + 4])
+#        pos += rdlen
+#    return None
+#
+#
+#def resolve_a(name):
+#    """(IPv4 address, "ok" | "filtered") for a name, or (None, "no-dns")."""
+#    try:
+#        qname = b"".join(bytes([len(p)]) + p.encode("ascii")
+#                         for p in name.rstrip(".").split(".")) + b"\x00"
+#    except (UnicodeEncodeError, ValueError):
+#        return None, "no-dns"
+#    for server in PING_RESOLVERS:
+#        qid = int.from_bytes(os.urandom(2), "big")
+#        packet = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0) + qname + struct.pack(">HH", 1, 1)
+#        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+#        sock.settimeout(PING_TIMEOUT)
+#        try:
+#            sock.sendto(packet, (server, DNS_PORT))
+#            data, _ = sock.recvfrom(4096)
+#        except OSError:
+#            continue
+#        finally:
+#            sock.close()
+#        ip = _first_a(data, qid)
+#        if ip:
+#            return ip, ("filtered" if ip.startswith(FILTERED_PREFIX) else "ok")
+#    return None, "no-dns"
+#
+#
+#def time_host(ip):
+#    """(median milliseconds, loss 0-1) for TCP connections to ip, on the first
+#    port in PING_PORTS that answers at all; (None, 1.0) if none does."""
+#    for port in PING_PORTS:
+#        times = []
+#        for _ in range(PING_TRIES):
+#            t0 = time.monotonic()
+#            try:
+#                socket.create_connection((ip, port), timeout=PING_TIMEOUT).close()
+#                times.append((time.monotonic() - t0) * 1000)
+#            except OSError:
+#                pass
+#        if times:
+#            times.sort()
+#            return round(times[len(times) // 2], 1), round(1 - len(times) / float(PING_TRIES), 2)
+#    return None, 1.0
+#
+#
+#def ping_round(targets):
+#    """Ping every target host, in parallel: {service: {"label", "hosts": [...]}}."""
+#    jobs = [(key, info.get("label") or key, host)
+#            for key, info in targets.items() if isinstance(info, dict)
+#            for host in (info.get("hosts") or [])[:8] if isinstance(host, str)]
+#
+#    def one(job):
+#        key, label, host = job
+#        ip, state = resolve_a(host)
+#        if not ip or state == "filtered":
+#            return key, label, {"host": host, "ip": ip or "", "ms": None,
+#                                "loss": 1.0, "state": state}
+#        ms, loss = time_host(ip)
+#        return key, label, {"host": host, "ip": ip, "ms": ms, "loss": loss,
+#                            "state": "ok" if ms is not None else "no-answer"}
+#
+#    out = {}
+#    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+#        for key, label, res in pool.map(one, jobs):
+#            out.setdefault(key, {"label": label, "hosts": []})["hosts"].append(res)
+#    return out
+#
+#
+#def note_ping_targets(targets):
+#    if isinstance(targets, dict):
+#        with PING_LOCK:
+#            PING_TARGETS.clear()
+#            PING_TARGETS.update({k: v for k, v in targets.items() if isinstance(v, dict)})
+#
+#
+#def take_pings():
+#    """The last round, once: a round is reported on the sync after it ends,
+#    not on every sync, so the exit writes it down every five minutes rather
+#    than every thirty seconds."""
+#    with PING_LOCK:
+#        out = dict(PINGS)
+#        PINGS.clear()
+#    return out
+#
+#
+#def ping_loop():
+#    while True:
+#        with PING_LOCK:
+#            targets = dict(PING_TARGETS)
+#        if not targets:
+#            time.sleep(10)          # the first sync has not said what yet
+#            continue
+#        try:
+#            result = ping_round(targets)
+#            with PING_LOCK:
+#                PINGS.clear()
+#                PINGS.update(result)
+#        except Exception as e:
+#            log(WARN, "game pings failed: %s" % e)
+#        time.sleep(PING_EVERY)
+#
+#
 #def sync_once():
 #    rows = current_state()
 #    counters = {r["ip"]: r["total"] for r in rows}
@@ -6287,7 +6521,11 @@ exit 0
 #              "dns": CFG.get("SELF_IP", "")}
 #    if CFG.get("PANEL_DOMAIN"):
 #        report["panel"] = "https://%s:%d" % (CFG["PANEL_DOMAIN"], PANEL_TLS_PORT)
+#    pings = take_pings()
+#    if pings:
+#        report["pings"] = pings
 #    answer = post("/sync", report)
+#    note_ping_targets(answer.get("ping_targets"))
 #    try:
 #        save_template_names(answer.get("templates"))
 #    except Exception as e:
@@ -7223,6 +7461,7 @@ exit 0
 #    if not os.path.exists(ACL):
 #        sys.exit("%s is missing - run the installer first" % ACL)
 #    threading.Thread(target=sync_loop, daemon=True).start()
+#    threading.Thread(target=ping_loop, daemon=True).start()
 #
 #    # Over TLS or not at all. This panel asks for a password and hands back a
 #    # session cookie, and there is no version of that which is safe over plain
@@ -9653,10 +9892,12 @@ exit 0
 #MENU_IP = "🌐 ثبت آی‌پی"
 #MENU_DNS = "📡 آدرس DNS"
 #MENU_HELP = "❓ راهنما"
+#MENU_PING = "📶 پینگ بازی‌ها"
 #MENU_ADMIN = "🛠 مدیریت"
 #MENU_CANCEL = "انصراف"
 #MENU_ACTIONS = {MENU_ACCOUNT: "account", MENU_BUY: "buy", MENU_IP: "ip",
-#                MENU_DNS: "dns", MENU_HELP: "help", MENU_ADMIN: "admin_home"}
+#                MENU_DNS: "dns", MENU_HELP: "help", MENU_ADMIN: "admin_home",
+#                MENU_PING: "pings"}
 #
 #STATUS = {"active": "✅ فعال", "pending": "⏳ در انتظار خرید پلن",
 #          "over_quota": "⛔️ حجم تمام شده", "expired": "⌛️ دوره تمام شده",
@@ -9731,6 +9972,35 @@ exit 0
 #        return None, "قیمت باید عدد صحیح و دست‌کم ۱٬۰۰۰ تومان باشد."
 #    return {"name": name, "quota_gb": gb, "days": int(days),
 #            "speed_mbps": mbps, "price": int(price)}, ""
+#
+#
+#def game_ping(game):
+#    """(fastest ms, "ok") for a game, or (None, "filtered" | "no-answer")."""
+#    hosts = game.get("hosts") or []
+#    times = [h["ms"] for h in hosts if isinstance(h, dict) and isinstance(h.get("ms"), (int, float))]
+#    if times:
+#        return min(times), "ok"
+#    states = {h.get("state") for h in hosts if isinstance(h, dict)}
+#    if states and states <= {"filtered"}:
+#        return None, "filtered"
+#    return None, "no-answer"
+#
+#
+#def ping_line(game):
+#    ms, state = game_ping(game)
+#    label = game.get("label") or "?"
+#    if ms is None:
+#        return ("🚫 %s — فیلتر است" if state == "filtered" else "⚫ %s — جواب نمی‌دهد") % label
+#    dot = "🟢" if ms < 80 else ("🟡" if ms < 150 else "🔴")
+#    return "%s %s — %d ms" % (dot, label, round(ms))
+#
+#
+#def host_state(h):
+#    if isinstance(h.get("ms"), (int, float)):
+#        loss = h.get("loss") or 0
+#        return "%d ms%s" % (round(h["ms"]),
+#                            (" · %d٪ از دست رفته" % round(loss * 100)) if loss else "")
+#    return {"filtered": "فیلتر", "no-dns": "بدون DNS"}.get(h.get("state"), "بی‌جواب")
 #
 #
 #def store_trials(store):
@@ -9824,7 +10094,7 @@ exit 0
 #                            reply_markup=markup, disable_web_page_preview=True)
 #
 #    def menu(self, chat):
-#        rows = [[MENU_ACCOUNT, MENU_BUY], [MENU_IP, MENU_DNS], [MENU_HELP]]
+#        rows = [[MENU_ACCOUNT, MENU_BUY], [MENU_IP, MENU_DNS], [MENU_PING, MENU_HELP]]
 #        if self.is_admin(chat):
 #            rows.append([MENU_ADMIN])
 #        return {"keyboard": [[{"text": t} for t in r] for r in rows],
@@ -10124,6 +10394,49 @@ exit 0
 #        self.say(chat, ("✅ " if res.get("ok") else "⚠️ ") + res.get("message", ""),
 #                 self.menu(chat))
 #
+#    def pings(self, chat, user):
+#        self.say(chat, self.ping_text(detail=False), self.menu(chat))
+#
+#    def ping_text(self, detail):
+#        """The latest game pings the relays measured.
+#
+#        Customers see one line per game, fastest first. The admin also sees
+#        every host behind it, its address and loss, and which relay measured.
+#        """
+#        relays = P.relay_pings(self.store)
+#        if not relays:
+#            return ("📶 هنوز پینگی اندازه گرفته نشده. سرور ایران هر ۵ دقیقه پینگ "
+#                    "سرورهای بازی را می‌گیرد؛ کمی بعد دوباره سر بزنید.")
+#        now = datetime.now(timezone.utc)
+#        lines = ["📶 پینگ سرورهای بازی از سرور ایران", ""]
+#        for relay, entry in sorted(relays.items()):
+#            if not isinstance(entry, dict):
+#                continue
+#            if detail or len(relays) > 1:
+#                lines.append("🖥 رله %s" % relay)
+#            games = [g for g in (entry.get("games") or {}).values() if isinstance(g, dict)]
+#            games.sort(key=lambda g: (game_ping(g)[0] is None, game_ping(g)[0] or 0,
+#                                      g.get("label") or ""))
+#            for g in games:
+#                lines.append(ping_line(g))
+#                if detail:
+#                    for h in g.get("hosts") or []:
+#                        lines.append("      %s %s— %s" % (
+#                            h.get("host") or "?", ("(%s) " % h["ip"]) if h.get("ip") else "",
+#                            host_state(h)))
+#            seen = P.parse_ts(entry.get("at"))
+#            if seen:
+#                age = int((now - seen).total_seconds() // 60)
+#                lines.append("⏱ %s%s" % (
+#                    "همین حالا" if age < 1 else "%d دقیقه پیش" % age,
+#                    " — قدیمی است؛ رله ممکن است قطع باشد" if age > P.PING_STALE_MINUTES else ""))
+#            lines.append("")
+#        if not detail:
+#            lines.append("این پینگِ سرور ما در ایران است، نه اینترنت شما: خود بازی آنلاین "
+#                         "مستقیم از اینترنت شما به سرور بازی وصل می‌شود، پس پینگ شما ممکن "
+#                         "است کمی فرق کند.")
+#        return "\n".join(lines).strip()
+#
 #    def dns(self, chat, user):
 #        address = self.setting("relay_dns") or (self.relays[0] if self.relays else "")
 #        if not address:
@@ -10186,7 +10499,7 @@ exit 0
 #            [btn("📥 رسیدها (%d)" % pending, "a:rc"), btn("👥 کاربران", "a:us")],
 #            [btn("📦 پلن‌ها", "a:pl"), btn("💳 روش‌های پرداخت", "a:py")],
 #            [btn("🎁 تست رایگان", "a:tr"), btn("📊 آمار", "a:st")],
-#            [btn("📢 پیام همگانی", "a:bc")]))
+#            [btn("📢 پیام همگانی", "a:bc"), btn("📶 پینگ", "a:pg")]))
 #
 #    def ask(self, chat, state, text):
 #        self.state[chat] = state
@@ -10197,7 +10510,8 @@ exit 0
 #        cmd = parts[0]
 #        ids = [int(x) for x in parts[1:] if x.isdigit()]
 #        pages = {"rc": self.admin_receipts, "us": self.admin_users, "pl": self.admin_plans,
-#                 "py": self.admin_payments, "st": self.admin_stats, "tr": self.admin_trial}
+#                 "py": self.admin_payments, "st": self.admin_stats, "tr": self.admin_trial,
+#                 "pg": self.admin_pings}
 #        if cmd in pages:
 #            return pages[cmd](chat)
 #        if cmd in ("ok", "no") and ids:
@@ -10571,6 +10885,10 @@ exit 0
 #            [btn("⏸ توقف فروش" if plan["active"] else "▶️ فروش دوباره", "a:pa:%d" % pid),
 #             btn("🗑 حذف", "a:pd:%d" % pid)],
 #            [btn("↩️ همهٔ پلن‌ها", "a:pl")]))
+#
+#    # game pings
+#    def admin_pings(self, chat):
+#        self.say(chat, self.ping_text(detail=True))
 #
 #    # the free trial
 #    def admin_trial(self, chat):

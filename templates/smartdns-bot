@@ -153,10 +153,12 @@ MENU_BUY = "🛒 خرید / تمدید"
 MENU_IP = "🌐 ثبت آی‌پی"
 MENU_DNS = "📡 آدرس DNS"
 MENU_HELP = "❓ راهنما"
+MENU_PING = "📶 پینگ بازی‌ها"
 MENU_ADMIN = "🛠 مدیریت"
 MENU_CANCEL = "انصراف"
 MENU_ACTIONS = {MENU_ACCOUNT: "account", MENU_BUY: "buy", MENU_IP: "ip",
-                MENU_DNS: "dns", MENU_HELP: "help", MENU_ADMIN: "admin_home"}
+                MENU_DNS: "dns", MENU_HELP: "help", MENU_ADMIN: "admin_home",
+                MENU_PING: "pings"}
 
 STATUS = {"active": "✅ فعال", "pending": "⏳ در انتظار خرید پلن",
           "over_quota": "⛔️ حجم تمام شده", "expired": "⌛️ دوره تمام شده",
@@ -231,6 +233,35 @@ def parse_plan(text):
         return None, "قیمت باید عدد صحیح و دست‌کم ۱٬۰۰۰ تومان باشد."
     return {"name": name, "quota_gb": gb, "days": int(days),
             "speed_mbps": mbps, "price": int(price)}, ""
+
+
+def game_ping(game):
+    """(fastest ms, "ok") for a game, or (None, "filtered" | "no-answer")."""
+    hosts = game.get("hosts") or []
+    times = [h["ms"] for h in hosts if isinstance(h, dict) and isinstance(h.get("ms"), (int, float))]
+    if times:
+        return min(times), "ok"
+    states = {h.get("state") for h in hosts if isinstance(h, dict)}
+    if states and states <= {"filtered"}:
+        return None, "filtered"
+    return None, "no-answer"
+
+
+def ping_line(game):
+    ms, state = game_ping(game)
+    label = game.get("label") or "?"
+    if ms is None:
+        return ("🚫 %s — فیلتر است" if state == "filtered" else "⚫ %s — جواب نمی‌دهد") % label
+    dot = "🟢" if ms < 80 else ("🟡" if ms < 150 else "🔴")
+    return "%s %s — %d ms" % (dot, label, round(ms))
+
+
+def host_state(h):
+    if isinstance(h.get("ms"), (int, float)):
+        loss = h.get("loss") or 0
+        return "%d ms%s" % (round(h["ms"]),
+                            (" · %d٪ از دست رفته" % round(loss * 100)) if loss else "")
+    return {"filtered": "فیلتر", "no-dns": "بدون DNS"}.get(h.get("state"), "بی‌جواب")
 
 
 def store_trials(store):
@@ -324,7 +355,7 @@ class Bot:
                             reply_markup=markup, disable_web_page_preview=True)
 
     def menu(self, chat):
-        rows = [[MENU_ACCOUNT, MENU_BUY], [MENU_IP, MENU_DNS], [MENU_HELP]]
+        rows = [[MENU_ACCOUNT, MENU_BUY], [MENU_IP, MENU_DNS], [MENU_PING, MENU_HELP]]
         if self.is_admin(chat):
             rows.append([MENU_ADMIN])
         return {"keyboard": [[{"text": t} for t in r] for r in rows],
@@ -624,6 +655,49 @@ class Bot:
         self.say(chat, ("✅ " if res.get("ok") else "⚠️ ") + res.get("message", ""),
                  self.menu(chat))
 
+    def pings(self, chat, user):
+        self.say(chat, self.ping_text(detail=False), self.menu(chat))
+
+    def ping_text(self, detail):
+        """The latest game pings the relays measured.
+
+        Customers see one line per game, fastest first. The admin also sees
+        every host behind it, its address and loss, and which relay measured.
+        """
+        relays = P.relay_pings(self.store)
+        if not relays:
+            return ("📶 هنوز پینگی اندازه گرفته نشده. سرور ایران هر ۵ دقیقه پینگ "
+                    "سرورهای بازی را می‌گیرد؛ کمی بعد دوباره سر بزنید.")
+        now = datetime.now(timezone.utc)
+        lines = ["📶 پینگ سرورهای بازی از سرور ایران", ""]
+        for relay, entry in sorted(relays.items()):
+            if not isinstance(entry, dict):
+                continue
+            if detail or len(relays) > 1:
+                lines.append("🖥 رله %s" % relay)
+            games = [g for g in (entry.get("games") or {}).values() if isinstance(g, dict)]
+            games.sort(key=lambda g: (game_ping(g)[0] is None, game_ping(g)[0] or 0,
+                                      g.get("label") or ""))
+            for g in games:
+                lines.append(ping_line(g))
+                if detail:
+                    for h in g.get("hosts") or []:
+                        lines.append("      %s %s— %s" % (
+                            h.get("host") or "?", ("(%s) " % h["ip"]) if h.get("ip") else "",
+                            host_state(h)))
+            seen = P.parse_ts(entry.get("at"))
+            if seen:
+                age = int((now - seen).total_seconds() // 60)
+                lines.append("⏱ %s%s" % (
+                    "همین حالا" if age < 1 else "%d دقیقه پیش" % age,
+                    " — قدیمی است؛ رله ممکن است قطع باشد" if age > P.PING_STALE_MINUTES else ""))
+            lines.append("")
+        if not detail:
+            lines.append("این پینگِ سرور ما در ایران است، نه اینترنت شما: خود بازی آنلاین "
+                         "مستقیم از اینترنت شما به سرور بازی وصل می‌شود، پس پینگ شما ممکن "
+                         "است کمی فرق کند.")
+        return "\n".join(lines).strip()
+
     def dns(self, chat, user):
         address = self.setting("relay_dns") or (self.relays[0] if self.relays else "")
         if not address:
@@ -686,7 +760,7 @@ class Bot:
             [btn("📥 رسیدها (%d)" % pending, "a:rc"), btn("👥 کاربران", "a:us")],
             [btn("📦 پلن‌ها", "a:pl"), btn("💳 روش‌های پرداخت", "a:py")],
             [btn("🎁 تست رایگان", "a:tr"), btn("📊 آمار", "a:st")],
-            [btn("📢 پیام همگانی", "a:bc")]))
+            [btn("📢 پیام همگانی", "a:bc"), btn("📶 پینگ", "a:pg")]))
 
     def ask(self, chat, state, text):
         self.state[chat] = state
@@ -697,7 +771,8 @@ class Bot:
         cmd = parts[0]
         ids = [int(x) for x in parts[1:] if x.isdigit()]
         pages = {"rc": self.admin_receipts, "us": self.admin_users, "pl": self.admin_plans,
-                 "py": self.admin_payments, "st": self.admin_stats, "tr": self.admin_trial}
+                 "py": self.admin_payments, "st": self.admin_stats, "tr": self.admin_trial,
+                 "pg": self.admin_pings}
         if cmd in pages:
             return pages[cmd](chat)
         if cmd in ("ok", "no") and ids:
@@ -1071,6 +1146,10 @@ class Bot:
             [btn("⏸ توقف فروش" if plan["active"] else "▶️ فروش دوباره", "a:pa:%d" % pid),
              btn("🗑 حذف", "a:pd:%d" % pid)],
             [btn("↩️ همهٔ پلن‌ها", "a:pl")]))
+
+    # game pings
+    def admin_pings(self, chat):
+        self.say(chat, self.ping_text(detail=True))
 
     # the free trial
     def admin_trial(self, chat):

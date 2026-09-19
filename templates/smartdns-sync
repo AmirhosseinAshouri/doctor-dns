@@ -26,6 +26,7 @@ still carries its own traffic through its own exit.
 """
 
 import base64
+import concurrent.futures
 import hashlib
 import hmac
 import html
@@ -36,7 +37,9 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import ssl
+import struct
 import subprocess
 import sys
 import threading
@@ -775,6 +778,161 @@ def close_relay_when_ready(allowed_count):
           % allowed_count, flush=True)
 
 
+# ---------------------------------------------------------------- game pings
+# How the games' servers answer from this relay, for the Telegram bot to show:
+# a TCP connection to each game's domains, timed. TCP rather than ICMP, because
+# many game servers ignore ping, and a connection is what a game makes anyway.
+#
+# Names are asked of public resolvers directly, never of this machine's own
+# dnsmasq: that answers every routed name with this relay's address, and a
+# ping to ourselves says nothing. The exit says which domains, on every sync.
+PING_EVERY = 300
+PING_TRIES = 3
+PING_TIMEOUT = 2.0
+PING_PORTS = (443, 80)
+PING_RESOLVERS = ("1.1.1.1", "8.8.8.8")
+DNS_PORT = 53
+# The address Iran's filtering hands out for a name it blocks. Such a name is
+# reported as filtered and never connected to.
+FILTERED_PREFIX = "10.10.34."
+PING_TARGETS = {}       # what to ping, from the exit
+PINGS = {}              # the last round, until the next sync takes it
+PING_LOCK = threading.Lock()
+
+
+def _skip_name(data, pos):
+    while pos < len(data):
+        n = data[pos]
+        if n == 0:
+            return pos + 1
+        if n & 0xC0 == 0xC0:
+            return pos + 2
+        pos += n + 1
+    return pos
+
+
+def _first_a(data, qid):
+    """The first A record in a DNS answer, or None."""
+    if len(data) < 12:
+        return None
+    rid, flags, qd, an = struct.unpack(">HHHH", data[:8])
+    if rid != qid or flags & 0x000F:
+        return None
+    pos = 12
+    for _ in range(qd):
+        pos = _skip_name(data, pos) + 4
+    for _ in range(an):
+        pos = _skip_name(data, pos)
+        if pos + 10 > len(data):
+            return None
+        rtype, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[pos:pos + 10])
+        pos += 10
+        if rtype == 1 and rdlen == 4:
+            return socket.inet_ntoa(data[pos:pos + 4])
+        pos += rdlen
+    return None
+
+
+def resolve_a(name):
+    """(IPv4 address, "ok" | "filtered") for a name, or (None, "no-dns")."""
+    try:
+        qname = b"".join(bytes([len(p)]) + p.encode("ascii")
+                         for p in name.rstrip(".").split(".")) + b"\x00"
+    except (UnicodeEncodeError, ValueError):
+        return None, "no-dns"
+    for server in PING_RESOLVERS:
+        qid = int.from_bytes(os.urandom(2), "big")
+        packet = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0) + qname + struct.pack(">HH", 1, 1)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(PING_TIMEOUT)
+        try:
+            sock.sendto(packet, (server, DNS_PORT))
+            data, _ = sock.recvfrom(4096)
+        except OSError:
+            continue
+        finally:
+            sock.close()
+        ip = _first_a(data, qid)
+        if ip:
+            return ip, ("filtered" if ip.startswith(FILTERED_PREFIX) else "ok")
+    return None, "no-dns"
+
+
+def time_host(ip):
+    """(median milliseconds, loss 0-1) for TCP connections to ip, on the first
+    port in PING_PORTS that answers at all; (None, 1.0) if none does."""
+    for port in PING_PORTS:
+        times = []
+        for _ in range(PING_TRIES):
+            t0 = time.monotonic()
+            try:
+                socket.create_connection((ip, port), timeout=PING_TIMEOUT).close()
+                times.append((time.monotonic() - t0) * 1000)
+            except OSError:
+                pass
+        if times:
+            times.sort()
+            return round(times[len(times) // 2], 1), round(1 - len(times) / float(PING_TRIES), 2)
+    return None, 1.0
+
+
+def ping_round(targets):
+    """Ping every target host, in parallel: {service: {"label", "hosts": [...]}}."""
+    jobs = [(key, info.get("label") or key, host)
+            for key, info in targets.items() if isinstance(info, dict)
+            for host in (info.get("hosts") or [])[:8] if isinstance(host, str)]
+
+    def one(job):
+        key, label, host = job
+        ip, state = resolve_a(host)
+        if not ip or state == "filtered":
+            return key, label, {"host": host, "ip": ip or "", "ms": None,
+                                "loss": 1.0, "state": state}
+        ms, loss = time_host(ip)
+        return key, label, {"host": host, "ip": ip, "ms": ms, "loss": loss,
+                            "state": "ok" if ms is not None else "no-answer"}
+
+    out = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        for key, label, res in pool.map(one, jobs):
+            out.setdefault(key, {"label": label, "hosts": []})["hosts"].append(res)
+    return out
+
+
+def note_ping_targets(targets):
+    if isinstance(targets, dict):
+        with PING_LOCK:
+            PING_TARGETS.clear()
+            PING_TARGETS.update({k: v for k, v in targets.items() if isinstance(v, dict)})
+
+
+def take_pings():
+    """The last round, once: a round is reported on the sync after it ends,
+    not on every sync, so the exit writes it down every five minutes rather
+    than every thirty seconds."""
+    with PING_LOCK:
+        out = dict(PINGS)
+        PINGS.clear()
+    return out
+
+
+def ping_loop():
+    while True:
+        with PING_LOCK:
+            targets = dict(PING_TARGETS)
+        if not targets:
+            time.sleep(10)          # the first sync has not said what yet
+            continue
+        try:
+            result = ping_round(targets)
+            with PING_LOCK:
+                PINGS.clear()
+                PINGS.update(result)
+        except Exception as e:
+            log(WARN, "game pings failed: %s" % e)
+        time.sleep(PING_EVERY)
+
+
 def sync_once():
     rows = current_state()
     counters = {r["ip"]: r["total"] for r in rows}
@@ -792,7 +950,11 @@ def sync_once():
               "dns": CFG.get("SELF_IP", "")}
     if CFG.get("PANEL_DOMAIN"):
         report["panel"] = "https://%s:%d" % (CFG["PANEL_DOMAIN"], PANEL_TLS_PORT)
+    pings = take_pings()
+    if pings:
+        report["pings"] = pings
     answer = post("/sync", report)
+    note_ping_targets(answer.get("ping_targets"))
     try:
         save_template_names(answer.get("templates"))
     except Exception as e:
@@ -1728,6 +1890,7 @@ def main():
     if not os.path.exists(ACL):
         sys.exit("%s is missing - run the installer first" % ACL)
     threading.Thread(target=sync_loop, daemon=True).start()
+    threading.Thread(target=ping_loop, daemon=True).start()
 
     # Over TLS or not at all. This panel asks for a password and hands back a
     # session cookie, and there is no version of that which is safe over plain

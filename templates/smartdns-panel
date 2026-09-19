@@ -795,6 +795,38 @@ class Store:
             (user_id, ip, now()))
         return {"ok": True, "message": "آی‌پی %s ثبت شد" % ip}
 
+    def note_pings(self, relay, pings):
+        """Keep the latest game pings a relay measured, one entry per relay.
+
+        What comes in is checked field by field and kept small: it is shown to
+        customers in the bot, and a relay is trusted to report its own numbers,
+        not to write arbitrary text into their chats.
+        """
+        if not isinstance(pings, dict) or not pings:
+            return
+        games = {}
+        for key, v in list(pings.items())[:64]:
+            if not (isinstance(key, str) and re.fullmatch(r"[a-z0-9_-]{1,32}", key)
+                    and isinstance(v, dict)):
+                continue
+            hosts = []
+            for h in (v.get("hosts") or [])[:16]:
+                if not isinstance(h, dict):
+                    continue
+                ms, loss = h.get("ms"), h.get("loss")
+                hosts.append({
+                    "host": str(h.get("host") or "")[:253],
+                    "ip": h["ip"] if isinstance(h.get("ip"), str) and valid_ip(h["ip"]) else "",
+                    "ms": float(ms) if isinstance(ms, (int, float)) and 0 <= ms < 60000 else None,
+                    "loss": float(loss) if isinstance(loss, (int, float)) and 0 <= loss <= 1 else 1.0,
+                    "state": str(h.get("state") or "")[:16]})
+            games[key] = {"label": str(v.get("label") or key)[:40], "hosts": hosts}
+        if not games:
+            return
+        every = relay_pings(self)
+        every[relay] = {"at": now(), "games": games}
+        self.set_setting("relay_pings", json.dumps(every, ensure_ascii=False))
+
     def note_relay(self, panel, dns):
         """Remember where a relay's customer pages are, and its DNS address.
 
@@ -1335,6 +1367,48 @@ def telegram_init_data(token, raw, max_age=None):
     return user
 
 
+# ------------------------------------------------------------- game pings
+# The catalogue's games, whose domains the relays ping so that customers can see
+# how each game's servers answer from Iran. The relay pings, not this machine:
+# this one is abroad, and its ping says nothing about an Iranian line.
+GAME_SERVICES = ("playstation", "xbox", "nintendo", "steam", "epic", "ea", "blizzard",
+                 "ubisoft", "riot", "rockstar", "bethesda", "gog", "roblox", "minecraft")
+PING_HOSTS_PER_GAME = 4
+# Older than this and the bot says so: the relay measures every five minutes,
+# so a quarter of an hour without news means it has stopped.
+PING_STALE_MINUTES = 15
+
+
+def ping_targets(catalogue):
+    """What each relay should ping: {service: {"label", "hosts"}}.
+
+    Taken from the catalogue rather than kept as a list of its own, so a game
+    added to it is pinged too. A few domains per game, not all of them.
+    """
+    out = {}
+    for svc in catalogue or []:
+        if svc.get("key") not in GAME_SERVICES:
+            continue
+        hosts = []
+        for grp in svc.get("groups") or []:
+            for d in grp.get("domains") or []:
+                if d not in hosts:
+                    hosts.append(d)
+        if hosts:
+            out[svc["key"]] = {"label": svc.get("label") or svc["key"],
+                               "hosts": hosts[:PING_HOSTS_PER_GAME]}
+    return out
+
+
+def relay_pings(store):
+    """{relay address: {"at": when, "games": {...}}}, the latest from each."""
+    try:
+        every = json.loads(store.setting("relay_pings", "") or "{}")
+    except ValueError:
+        return {}
+    return every if isinstance(every, dict) else {}
+
+
 def trial_settings(store):
     return {"on": store.setting("trial_on", "1") == "1",
             "gb": float(store.setting("trial_gb", "1") or 0),
@@ -1781,6 +1855,7 @@ class API(http.server.BaseHTTPRequestHandler):
             # second relay appears on its own without any configuration.
             self.store.record_metrics(self.client_address[0], body.get("host") or {})
             self.store.note_relay(body.get("panel"), body.get("dns"))
+            self.store.note_pings(self.client_address[0], body.get("pings"))
             # Quotas are evaluated here, on fresh numbers, so a user who runs
             # out is off the list this relay is about to be handed.
             try:
@@ -1804,6 +1879,7 @@ class API(http.server.BaseHTTPRequestHandler):
             return self.reply(200, {"allowed": allowed, "profiles": profiles,
                                     "extra_domains": extra,
                                     "templates": self.store.template_names(),
+                                    "ping_targets": ping_targets(CATALOGUE),
                                     })
 
         # ---- user panel, served by the relay on the customer's behalf ----
